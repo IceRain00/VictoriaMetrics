@@ -13,6 +13,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/workingsetcache"
 	"github.com/VictoriaMetrics/fastcache"
 	"github.com/VictoriaMetrics/metrics"
@@ -20,11 +21,43 @@ import (
 )
 
 var (
-	disableCache         = flag.Bool("search.disableCache", false, "Whether to disable response caching. This may be useful during data backfilling")
 	cacheTimestampOffset = flag.Duration("search.cacheTimestampOffset", 5*time.Minute, "The maximum duration since the current time for response data, "+
 		"which is always queried from the original raw data, without using the response cache. Increase this value if you see gaps in responses "+
 		"due to time synchronization issues between VictoriaMetrics and data sources")
 )
+
+// ResetRollupResultCacheIfNeeded resets rollup result cache if mrs contains timestamps outside `now - search.cacheTimestampOffset`.
+func ResetRollupResultCacheIfNeeded(mrs []storage.MetricRow) {
+	checkRollupResultCacheResetOnce.Do(func() {
+		go checkRollupResultCacheReset()
+	})
+	minTimestamp := int64(fasttime.UnixTimestamp()*1000) - cacheTimestampOffset.Milliseconds() + checkRollupResultCacheResetInterval.Milliseconds()
+	needCacheReset := false
+	for i := range mrs {
+		if mrs[i].Timestamp < minTimestamp {
+			needCacheReset = true
+			break
+		}
+	}
+	if needCacheReset {
+		// Do not call ResetRollupResultCache() here, since it may be heavy when frequently called.
+		atomic.StoreUint32(&needRollupResultCacheReset, 1)
+	}
+}
+
+func checkRollupResultCacheReset() {
+	for {
+		time.Sleep(checkRollupResultCacheResetInterval)
+		if atomic.SwapUint32(&needRollupResultCacheReset, 0) > 0 {
+			ResetRollupResultCache()
+		}
+	}
+}
+
+const checkRollupResultCacheResetInterval = 5 * time.Second
+
+var needRollupResultCacheReset uint32
+var checkRollupResultCacheResetOnce sync.Once
 
 var rollupResultCacheV = &rollupResultCache{
 	c: workingsetcache.New(1024*1024, time.Hour), // This is a cache for testing.
@@ -137,7 +170,7 @@ func ResetRollupResultCache() {
 }
 
 func (rrc *rollupResultCache) Get(ec *EvalConfig, expr metricsql.Expr, window int64) (tss []*timeseries, newStart int64) {
-	if *disableCache || !ec.mayCache() {
+	if !ec.mayCache() {
 		return nil, ec.Start
 	}
 
@@ -218,7 +251,7 @@ func (rrc *rollupResultCache) Get(ec *EvalConfig, expr metricsql.Expr, window in
 var resultBufPool bytesutil.ByteBufferPool
 
 func (rrc *rollupResultCache) Put(ec *EvalConfig, expr metricsql.Expr, window int64, tss []*timeseries) {
-	if *disableCache || len(tss) == 0 || !ec.mayCache() {
+	if len(tss) == 0 || !ec.mayCache() {
 		return
 	}
 

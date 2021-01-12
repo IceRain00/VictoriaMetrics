@@ -10,6 +10,12 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 )
 
+func init() {
+	// Disable rand sleep on group start during tests in order to speed up test execution.
+	// Rand sleep is needed only in prod code.
+	skipRandSleepOnGroupStart = true
+}
+
 func TestUpdateWith(t *testing.T) {
 	testCases := []struct {
 		name         string
@@ -26,7 +32,7 @@ func TestUpdateWith(t *testing.T) {
 			[]config.Rule{{
 				Alert: "foo",
 				Expr:  "up > 0",
-				For:   time.Second,
+				For:   config.NewPromDuration(time.Second),
 				Labels: map[string]string{
 					"bar": "baz",
 				},
@@ -38,7 +44,7 @@ func TestUpdateWith(t *testing.T) {
 			[]config.Rule{{
 				Alert: "foo",
 				Expr:  "up > 10",
-				For:   time.Second,
+				For:   config.NewPromDuration(time.Second),
 				Labels: map[string]string{
 					"baz": "bar",
 				},
@@ -150,7 +156,7 @@ func TestGroupStart(t *testing.T) {
 		t.Fatalf("failed to parse rules: %s", err)
 	}
 	const evalInterval = time.Millisecond
-	g := newGroup(groups[0], evalInterval)
+	g := newGroup(groups[0], evalInterval, map[string]string{"cluster": "east-1"})
 	g.Concurrency = 2
 
 	fn := &fakeNotifier{}
@@ -161,18 +167,28 @@ func TestGroupStart(t *testing.T) {
 	m2 := metricWithLabels(t, "instance", inst2, "job", job)
 
 	r := g.Rules[0].(*AlertingRule)
-	alert1, err := r.newAlert(m1, time.Now())
+	alert1, err := r.newAlert(m1, time.Now(), nil)
 	if err != nil {
 		t.Fatalf("faield to create alert: %s", err)
 	}
 	alert1.State = notifier.StateFiring
+	// add external label
+	alert1.Labels["cluster"] = "east-1"
+	// add rule labels - see config/testdata/rules1-good.rules
+	alert1.Labels["label"] = "bar"
+	alert1.Labels["host"] = inst1
 	alert1.ID = hash(m1)
 
-	alert2, err := r.newAlert(m2, time.Now())
+	alert2, err := r.newAlert(m2, time.Now(), nil)
 	if err != nil {
 		t.Fatalf("faield to create alert: %s", err)
 	}
 	alert2.State = notifier.StateFiring
+	// add external label
+	alert2.Labels["cluster"] = "east-1"
+	// add rule labels - see config/testdata/rules1-good.rules
+	alert2.Labels["label"] = "bar"
+	alert2.Labels["host"] = inst2
 	alert2.ID = hash(m2)
 
 	finished := make(chan struct{})

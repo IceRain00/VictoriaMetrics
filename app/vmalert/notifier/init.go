@@ -1,7 +1,6 @@
 package notifier
 
 import (
-	"flag"
 	"fmt"
 	"net/http"
 
@@ -11,10 +10,10 @@ import (
 
 var (
 	addrs             = flagutil.NewArray("notifier.url", "Prometheus alertmanager URL. Required parameter. e.g. http://127.0.0.1:9093")
-	basicAuthUsername = flagutil.NewArray("notifier.basicAuth.username", "Optional basic auth username for -datasource.url")
-	basicAuthPassword = flagutil.NewArray("notifier.basicAuth.password", "Optional basic auth password for -datasource.url")
+	basicAuthUsername = flagutil.NewArray("notifier.basicAuth.username", "Optional basic auth username for -notifier.url")
+	basicAuthPassword = flagutil.NewArray("notifier.basicAuth.password", "Optional basic auth password for -notifier.url")
 
-	tlsInsecureSkipVerify = flag.Bool("notifier.tlsInsecureSkipVerify", false, "Whether to skip tls verification when connecting to -notifier.url")
+	tlsInsecureSkipVerify = flagutil.NewArrayBool("notifier.tlsInsecureSkipVerify", "Whether to skip tls verification when connecting to -notifier.url")
 	tlsCertFile           = flagutil.NewArray("notifier.tlsCertFile", "Optional path to client-side TLS certificate file to use when connecting to -notifier.url")
 	tlsKeyFile            = flagutil.NewArray("notifier.tlsKeyFile", "Optional path to client-side TLS certificate key to use when connecting to -notifier.url")
 	tlsCAFile             = flagutil.NewArray("notifier.tlsCAFile", "Optional path to TLS CA file to use for verifying connections to -notifier.url. "+
@@ -26,7 +25,6 @@ var (
 // Init creates a Notifier object based on provided flags.
 func Init(gen AlertURLGenerator) ([]Notifier, error) {
 	if len(*addrs) == 0 {
-		flag.PrintDefaults()
 		return nil, fmt.Errorf("at least one `-notifier.url` must be set")
 	}
 
@@ -34,7 +32,7 @@ func Init(gen AlertURLGenerator) ([]Notifier, error) {
 	for i, addr := range *addrs {
 		cert, key := tlsCertFile.GetOptionalArg(i), tlsKeyFile.GetOptionalArg(i)
 		ca, serverName := tlsCAFile.GetOptionalArg(i), tlsServerName.GetOptionalArg(i)
-		tr, err := utils.Transport(addr, cert, key, ca, serverName, *tlsInsecureSkipVerify)
+		tr, err := utils.Transport(addr, cert, key, ca, serverName, tlsInsecureSkipVerify.GetOptionalArg(i))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create transport: %w", err)
 		}

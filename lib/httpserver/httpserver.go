@@ -18,10 +18,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/klauspost/compress/gzip"
+	"github.com/valyala/fastrand"
 )
 
 var (
@@ -42,6 +44,9 @@ var (
 		"Highly loaded server may require increased value for graceful shutdown")
 	shutdownDelay = flag.Duration("http.shutdownDelay", 0, "Optional delay before http server shutdown. During this dealy the servier returns non-OK responses "+
 		"from /health page, so load balancers can route new requests to other servers")
+	idleConnTimeout = flag.Duration("http.idleConnTimeout", time.Minute, "Timeout for incoming idle http connections")
+	connTimeout     = flag.Duration("http.connTimeout", 2*time.Minute, "Incoming http connections are closed after the configured timeout. This may help spreading incoming load "+
+		"among a cluster of services behind load balancer. Note that the real timeout may be bigger by up to 10% as a protection from Thundering herd problem")
 )
 
 var (
@@ -104,12 +109,22 @@ func serveWithListener(addr string, ln net.Listener, rh RequestHandler) {
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 
 		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       time.Minute,
+		IdleTimeout:       *idleConnTimeout,
 
 		// Do not set ReadTimeout and WriteTimeout here,
 		// since these timeouts must be controlled by request handlers.
 
 		ErrorLog: logger.StdErrorLogger(),
+
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			timeoutSec := connTimeout.Seconds()
+			// Add a jitter for connection timeout in order to prevent Thundering herd problem
+			// when all the connections are established at the same time.
+			// See https://en.wikipedia.org/wiki/Thundering_herd_problem
+			jitterSec := fastrand.Uint32n(uint32(timeoutSec / 10))
+			deadline := fasttime.UnixTimestamp() + uint64(timeoutSec) + uint64(jitterSec)
+			return context.WithValue(ctx, connDeadlineTimeKey, &deadline)
+		},
 	}
 	serversLock.Lock()
 	servers[addr] = &s
@@ -122,6 +137,15 @@ func serveWithListener(addr string, ln net.Listener, rh RequestHandler) {
 		logger.Panicf("FATAL: cannot serve http at %s: %s", addr, err)
 	}
 }
+
+func whetherToCloseConn(r *http.Request) bool {
+	ctx := r.Context()
+	v := ctx.Value(connDeadlineTimeKey)
+	deadline, ok := v.(*uint64)
+	return ok && fasttime.UnixTimestamp() > *deadline
+}
+
+var connDeadlineTimeKey = interface{}("connDeadlineSecs")
 
 // Stop stops the http server on the given addr, which has been started
 // via Serve func.
@@ -167,19 +191,24 @@ func gzipHandler(s *server, rh RequestHandler) http.HandlerFunc {
 }
 
 var metricsHandlerDuration = metrics.NewHistogram(`vm_http_request_duration_seconds{path="/metrics"}`)
+var connTimeoutClosedConns = metrics.NewCounter(`vm_http_conn_timeout_closed_conns_total`)
 
 func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh RequestHandler) {
 	requestsTotal.Inc()
+	if whetherToCloseConn(r) {
+		connTimeoutClosedConns.Inc()
+		w.Header().Set("Connection", "close")
+	}
 	path, err := getCanonicalPath(r.URL.Path)
 	if err != nil {
-		Errorf(w, "cannot get canonical path: %s", err)
+		Errorf(w, r, "cannot get canonical path: %s", err)
 		unsupportedRequestErrors.Inc()
 		return
 	}
 	r.URL.Path = path
 	switch r.URL.Path {
 	case "/health":
-		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		deadline := atomic.LoadInt64(&s.shutdownDelayDeadline)
 		if deadline <= 0 {
 			w.Write([]byte("OK"))
@@ -215,7 +244,7 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 			return
 		}
 		startTime := time.Now()
-		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		WritePrometheusMetrics(w)
 		metricsHandlerDuration.UpdateDuration(startTime)
 		return
@@ -238,15 +267,18 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 			return
 		}
 
-		Errorf(w, "unsupported path requested: %q", r.URL.Path)
+		Errorf(w, r, "unsupported path requested: %q", r.URL.Path)
 		unsupportedRequestErrors.Inc()
 		return
 	}
 }
 
 func getCanonicalPath(path string) (string, error) {
-	if len(*pathPrefix) == 0 {
+	if len(*pathPrefix) == 0 || path == "/" {
 		return path, nil
+	}
+	if *pathPrefix == path {
+		return "/", nil
 	}
 	prefix := *pathPrefix
 	if !strings.HasSuffix(prefix, "/") {
@@ -275,6 +307,9 @@ func checkBasicAuth(w http.ResponseWriter, r *http.Request) bool {
 
 func maybeGzipResponseWriter(w http.ResponseWriter, r *http.Request) http.ResponseWriter {
 	if *disableResponseCompression {
+		return w
+	}
+	if r.Header.Get("Connection") == "Upgrade" {
 		return w
 	}
 	ae := r.Header.Get("Accept-Encoding")
@@ -363,7 +398,7 @@ func (zrw *gzipResponseWriter) Write(p []byte) (int, error) {
 			if h.Get("Content-Type") == "" {
 				// Disable auto-detection of content-type, since it
 				// is incorrectly detected after the compression.
-				h.Set("Content-Type", "text/html")
+				h.Set("Content-Type", "text/html; charset=utf-8")
 			}
 		}
 		zrw.writeHeader()
@@ -481,9 +516,20 @@ var (
 	requestsTotal = metrics.NewCounter(`vm_http_requests_all_total`)
 )
 
+// GetQuotedRemoteAddr returns quoted remote address.
+func GetQuotedRemoteAddr(r *http.Request) string {
+	remoteAddr := strconv.Quote(r.RemoteAddr) // quote remoteAddr and X-Forwarded-For, since they may contain untrusted input
+	if addr := r.Header.Get("X-Forwarded-For"); addr != "" {
+		remoteAddr += ", X-Forwarded-For: " + strconv.Quote(addr)
+	}
+	return remoteAddr
+}
+
 // Errorf writes formatted error message to w and to logger.
-func Errorf(w http.ResponseWriter, format string, args ...interface{}) {
+func Errorf(w http.ResponseWriter, r *http.Request, format string, args ...interface{}) {
 	errStr := fmt.Sprintf(format, args...)
+	remoteAddr := GetQuotedRemoteAddr(r)
+	errStr = fmt.Sprintf("remoteAddr: %s; %s", remoteAddr, errStr)
 	logger.WarnfSkipframes(1, "%s", errStr)
 
 	// Extract statusCode from args
@@ -529,4 +575,9 @@ func isTrivialNetworkError(err error) bool {
 // IsTLS indicates is tls enabled or not
 func IsTLS() bool {
 	return *tlsEnable
+}
+
+// GetPathPrefix - returns http server path prefix.
+func GetPathPrefix() string {
+	return *pathPrefix
 }

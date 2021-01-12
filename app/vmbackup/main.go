@@ -10,24 +10,26 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/actions"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/fslocal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/fsnil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envflag"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
 var (
 	storageDataPath   = flag.String("storageDataPath", "victoria-metrics-data", "Path to VictoriaMetrics data. Must match -storageDataPath from VictoriaMetrics or vmstorage")
-	snapshotName      = flag.String("snapshotName", "", "Name for the snapshot to backup. See https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-work-with-snapshots")
-	snapshotCreateURL = flag.String("snapshot.createURL", "", "VictoriaMetrics create snapshot url. When this is given a snapshot will automatically be created during backup."+
+	snapshotName      = flag.String("snapshotName", "", "Name for the snapshot to backup. See https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#how-to-work-with-snapshots")
+	snapshotCreateURL = flag.String("snapshot.createURL", "", "VictoriaMetrics create snapshot url. When this is given a snapshot will automatically be created during backup. "+
 		"Example: http://victoriametrics:8428/snaphsot/create")
-	snapshotDeleteURL = flag.String("snapshot.deleteURL", "", "VictoriaMetrics delete snapshot url. Optional. Will be generated from snapshotCreateURL if not provided. All created snaphosts will be automatically deleted."+
-		"Example: http://victoriametrics:8428/snaphsot/delete")
+	snapshotDeleteURL = flag.String("snapshot.deleteURL", "", "VictoriaMetrics delete snapshot url. Optional. Will be generated from -snapshot.createURL if not provided. "+
+		"All created snaphosts will be automatically deleted. Example: http://victoriametrics:8428/snaphsot/delete")
 	dst = flag.String("dst", "", "Where to put the backup on the remote storage. "+
 		"Example: gcs://bucket/path/to/backup/dir, s3://bucket/path/to/backup/dir or fs:///path/to/local/backup/dir\n"+
 		"-dst can point to the previous backup. In this case incremental backup is performed, i.e. only changed data is uploaded")
 	origin            = flag.String("origin", "", "Optional origin directory on the remote storage with old backup for server-side copying when performing full backup. This speeds up full backups")
 	concurrency       = flag.Int("concurrency", 10, "The number of concurrent workers. Higher concurrency may reduce backup duration")
-	maxBytesPerSecond = flag.Int("maxBytesPerSecond", 0, "The maximum upload speed. There is no limit if it is set to 0")
+	maxBytesPerSecond = flagutil.NewBytes("maxBytesPerSecond", 0, "The maximum upload speed. There is no limit if it is set to 0")
 )
 
 func main() {
@@ -36,9 +38,10 @@ func main() {
 	flag.Usage = usage
 	envflag.Parse()
 	buildinfo.Init()
+	logger.Init()
 
 	if len(*snapshotCreateURL) > 0 {
-		logger.Infof("%s", "Snapshots enabled")
+		logger.Infof("Snapshots enabled")
 		logger.Infof("Snapshot create url %s", *snapshotCreateURL)
 		if len(*snapshotDeleteURL) <= 0 {
 			err := flag.Set("snapshot.deleteURL", strings.Replace(*snapshotCreateURL, "/create", "/delete", 1))
@@ -50,17 +53,17 @@ func main() {
 
 		name, err := snapshot.Create(*snapshotCreateURL)
 		if err != nil {
-			logger.Fatalf("%s", err)
+			logger.Fatalf("cannot create snapshot: %s", err)
 		}
 		err = flag.Set("snapshotName", name)
 		if err != nil {
-			logger.Fatalf("Failed to set snapshotName flag: %v", err)
+			logger.Fatalf("cannot set snapshotName flag: %v", err)
 		}
 
 		defer func() {
 			err := snapshot.Delete(*snapshotDeleteURL, name)
 			if err != nil {
-				logger.Fatalf("%s", err)
+				logger.Fatalf("cannot delete snapshot: %s", err)
 			}
 		}()
 	}
@@ -86,6 +89,9 @@ func main() {
 	if err := a.Run(); err != nil {
 		logger.Fatalf("cannot create backup: %s", err)
 	}
+	srcFS.MustStop()
+	dstFS.MustStop()
+	originFS.MustStop()
 }
 
 func usage() {
@@ -93,12 +99,9 @@ func usage() {
 vmbackup performs backups for VictoriaMetrics data from instant snapshots to gcs, s3
 or local filesystem. Backed up data can be restored with vmrestore.
 
-See the docs at https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/app/vmbackup/README.md .
+See the docs at https://victoriametrics.github.io/vbackup.html .
 `
-
-	f := flag.CommandLine.Output()
-	fmt.Fprintf(f, "%s\n", s)
-	flag.PrintDefaults()
+	flagutil.Usage(s)
 }
 
 func newSrcFS() (*fslocal.FS, error) {
@@ -123,7 +126,7 @@ func newSrcFS() (*fslocal.FS, error) {
 
 	fs := &fslocal.FS{
 		Dir:               snapshotPath,
-		MaxBytesPerSecond: *maxBytesPerSecond,
+		MaxBytesPerSecond: maxBytesPerSecond.N,
 	}
 	if err := fs.Init(); err != nil {
 		return nil, fmt.Errorf("cannot initialize fs: %w", err)
@@ -139,9 +142,9 @@ func newDstFS() (common.RemoteFS, error) {
 	return fs, nil
 }
 
-func newOriginFS() (common.RemoteFS, error) {
+func newOriginFS() (common.OriginFS, error) {
 	if len(*origin) == 0 {
-		return nil, nil
+		return &fsnil.FS{}, nil
 	}
 	fs, err := actions.NewRemoteFS(*origin)
 	if err != nil {

@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 )
 
 func TestMain(m *testing.M) {
@@ -47,7 +48,7 @@ func openBenchTable(b *testing.B, startTimestamp int64, rowsPerInsert, rowsCount
 		createBenchTable(b, path, startTimestamp, rowsPerInsert, rowsCount, tsidsCount)
 		createdBenchTables[path] = true
 	}
-	tb, err := openTable(path, -1, nilGetDeletedMetricIDs)
+	tb, err := openTable(path, nilGetDeletedMetricIDs, maxRetentionMsecs)
 	if err != nil {
 		b.Fatalf("cnanot open table %q: %s", path, err)
 	}
@@ -70,7 +71,7 @@ var createdBenchTables = make(map[string]bool)
 func createBenchTable(b *testing.B, path string, startTimestamp int64, rowsPerInsert, rowsCount, tsidsCount int) {
 	b.Helper()
 
-	tb, err := openTable(path, -1, nilGetDeletedMetricIDs)
+	tb, err := openTable(path, nilGetDeletedMetricIDs, maxRetentionMsecs)
 	if err != nil {
 		b.Fatalf("cannot open table %q: %s", path, err)
 	}
@@ -79,7 +80,7 @@ func createBenchTable(b *testing.B, path string, startTimestamp int64, rowsPerIn
 	timestamp := uint64(startTimestamp)
 
 	var wg sync.WaitGroup
-	for k := 0; k < runtime.GOMAXPROCS(-1); k++ {
+	for k := 0; k < cgroup.AvailableCPUs(); k++ {
 		wg.Add(1)
 		go func() {
 			rows := make([]rawRow, rowsPerInsert)

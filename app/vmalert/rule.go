@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
@@ -21,4 +22,9 @@ type Rule interface {
 	// UpdateWith performs modification of current Rule
 	// with fields of the given Rule.
 	UpdateWith(Rule) error
+	// Close performs the shutdown procedures for rule
+	// such as metrics unregister
+	Close()
 }
+
+var errDuplicate = errors.New("result contains metrics with the same labelset after applying rule labels")

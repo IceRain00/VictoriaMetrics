@@ -4,13 +4,14 @@ import (
 	"flag"
 	"io"
 	"net/http"
-	"runtime"
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/remotewrite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/influx"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
 	"github.com/VictoriaMetrics/metrics"
@@ -62,19 +63,20 @@ func insertRows(db string, rows []parser.Row) error {
 	buf := ctx.buf[:0]
 	for i := range rows {
 		r := &rows[i]
+		rowsTotal += len(r.Fields)
 		commonLabels = commonLabels[:0]
-		hasDBLabel := false
+		hasDBKey := false
 		for j := range r.Tags {
 			tag := &r.Tags[j]
 			if tag.Key == "db" {
-				hasDBLabel = true
+				hasDBKey = true
 			}
 			commonLabels = append(commonLabels, prompbmarshal.Label{
 				Name:  tag.Key,
 				Value: tag.Value,
 			})
 		}
-		if len(db) > 0 && !hasDBLabel {
+		if len(db) > 0 && !hasDBKey {
 			commonLabels = append(commonLabels, prompbmarshal.Label{
 				Name:  "db",
 				Value: db,
@@ -111,7 +113,6 @@ func insertRows(db string, rows []parser.Row) error {
 				Samples: samples[len(samples)-1:],
 			})
 		}
-		rowsTotal += len(r.Fields)
 	}
 	ctx.buf = buf
 	ctx.ctx.WriteRequest.Timeseries = tssDst
@@ -135,12 +136,8 @@ type pushCtx struct {
 func (ctx *pushCtx) reset() {
 	ctx.ctx.Reset()
 
-	commonLabels := ctx.commonLabels
-	for i := range commonLabels {
-		label := &commonLabels[i]
-		label.Name = ""
-		label.Value = ""
-	}
+	promrelabel.CleanLabels(ctx.commonLabels)
+	ctx.commonLabels = ctx.commonLabels[:0]
 
 	ctx.metricGroupBuf = ctx.metricGroupBuf[:0]
 	ctx.buf = ctx.buf[:0]
@@ -168,4 +165,4 @@ func putPushCtx(ctx *pushCtx) {
 }
 
 var pushCtxPool sync.Pool
-var pushCtxPoolCh = make(chan *pushCtx, runtime.GOMAXPROCS(-1))
+var pushCtxPoolCh = make(chan *pushCtx, cgroup.AvailableCPUs())

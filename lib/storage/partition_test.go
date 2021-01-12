@@ -18,7 +18,7 @@ func TestAppendPartsToMerge(t *testing.T) {
 	testAppendPartsToMerge(t, 2, []uint64{123}, nil)
 	testAppendPartsToMerge(t, 2, []uint64{4, 2}, nil)
 	testAppendPartsToMerge(t, 2, []uint64{128, 64, 32, 16, 8, 4, 2, 1}, nil)
-	testAppendPartsToMerge(t, 4, []uint64{128, 64, 32, 10, 9, 7, 2, 1}, []uint64{2, 7, 9, 10})
+	testAppendPartsToMerge(t, 4, []uint64{128, 64, 32, 10, 9, 7, 3, 1}, []uint64{3, 7, 9, 10})
 	testAppendPartsToMerge(t, 2, []uint64{128, 64, 32, 16, 8, 4, 2, 2}, []uint64{2, 2})
 	testAppendPartsToMerge(t, 4, []uint64{128, 64, 32, 16, 8, 4, 2, 2}, []uint64{2, 2, 4, 8})
 	testAppendPartsToMerge(t, 2, []uint64{1, 1}, []uint64{1, 1})
@@ -26,7 +26,9 @@ func TestAppendPartsToMerge(t *testing.T) {
 	testAppendPartsToMerge(t, 2, []uint64{4, 2, 4}, []uint64{4, 4})
 	testAppendPartsToMerge(t, 2, []uint64{1, 3, 7, 2}, nil)
 	testAppendPartsToMerge(t, 3, []uint64{1, 3, 7, 2}, []uint64{1, 2, 3})
-	testAppendPartsToMerge(t, 4, []uint64{1, 3, 7, 2}, []uint64{1, 2, 3})
+	testAppendPartsToMerge(t, 4, []uint64{1, 3, 7, 2}, nil)
+	testAppendPartsToMerge(t, 4, []uint64{1e6, 3e6, 7e6, 2e6}, []uint64{1e6, 2e6, 3e6})
+	testAppendPartsToMerge(t, 4, []uint64{2, 3, 7, 2}, []uint64{2, 2, 3, 7})
 	testAppendPartsToMerge(t, 3, []uint64{11, 1, 10, 100, 10}, []uint64{10, 10, 11})
 }
 
@@ -35,8 +37,9 @@ func TestAppendPartsToMergeManyParts(t *testing.T) {
 	// using minimum merges.
 	var a []uint64
 	maxOutPartRows := uint64(0)
+	r := rand.New(rand.NewSource(1))
 	for i := 0; i < 1024; i++ {
-		n := uint64(uint32(rand.NormFloat64() * 1e9))
+		n := uint64(uint32(r.NormFloat64() * 1e9))
 		if n < 0 {
 			n = -n
 		}
@@ -49,7 +52,7 @@ func TestAppendPartsToMergeManyParts(t *testing.T) {
 	iterationsCount := 0
 	rowsMerged := uint64(0)
 	for {
-		pms := appendPartsToMerge(nil, pws, defaultPartsToMerge, maxOutPartRows)
+		pms, _ := appendPartsToMerge(nil, pws, defaultPartsToMerge, maxOutPartRows)
 		if len(pms) == 0 {
 			break
 		}
@@ -83,11 +86,11 @@ func TestAppendPartsToMergeManyParts(t *testing.T) {
 		rowsTotal += uint64(rc)
 	}
 	overhead := float64(rowsMerged) / float64(rowsTotal)
-	if overhead > 2.96 {
+	if overhead > 2.1 {
 		t.Fatalf("too big overhead; rowsCount=%d, iterationsCount=%d, rowsTotal=%d, rowsMerged=%d, overhead=%f",
 			rowsCount, iterationsCount, rowsTotal, rowsMerged, overhead)
 	}
-	if len(rowsCount) > 40 {
+	if len(rowsCount) > 18 {
 		t.Fatalf("too many rowsCount %d; rowsCount=%d, iterationsCount=%d, rowsTotal=%d, rowsMerged=%d, overhead=%f",
 			len(rowsCount), rowsCount, iterationsCount, rowsTotal, rowsMerged, overhead)
 	}
@@ -99,7 +102,7 @@ func testAppendPartsToMerge(t *testing.T, maxPartsToMerge int, initialRowsCount,
 	pws := newTestPartWrappersForRowsCount(initialRowsCount)
 
 	// Verify appending to nil.
-	pms := appendPartsToMerge(nil, pws, maxPartsToMerge, 1e9)
+	pms, _ := appendPartsToMerge(nil, pws, maxPartsToMerge, 1e9)
 	rowsCount := newTestRowsCountFromPartWrappers(pms)
 	if !reflect.DeepEqual(rowsCount, expectedRowsCount) {
 		t.Fatalf("unexpected rowsCount for maxPartsToMerge=%d, initialRowsCount=%d; got\n%d; want\n%d",
@@ -118,7 +121,7 @@ func testAppendPartsToMerge(t *testing.T, maxPartsToMerge int, initialRowsCount,
 		{},
 		{},
 	}
-	pms = appendPartsToMerge(prefix, pws, maxPartsToMerge, 1e9)
+	pms, _ = appendPartsToMerge(prefix, pws, maxPartsToMerge, 1e9)
 	if !reflect.DeepEqual(pms[:len(prefix)], prefix) {
 		t.Fatalf("unexpected prefix for maxPartsToMerge=%d, initialRowsCount=%d; got\n%+v; want\n%+v",
 			maxPartsToMerge, initialRowsCount, pms[:len(prefix)], prefix)

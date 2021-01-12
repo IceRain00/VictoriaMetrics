@@ -3,15 +3,21 @@ package promscrape
 import (
 	"flag"
 	"fmt"
+	"math"
+	"math/bits"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/leveledbytebufferpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 	"github.com/VictoriaMetrics/metrics"
 	xxhash "github.com/cespare/xxhash/v2"
 )
@@ -22,10 +28,9 @@ var (
 )
 
 // ScrapeWork represents a unit of work for scraping Prometheus metrics.
+//
+// It must be immutable during its lifetime, since it is read from concurrently running goroutines.
 type ScrapeWork struct {
-	// Unique ID for the ScrapeWork.
-	ID uint64
-
 	// Full URL (including query args) for the scrape.
 	ScrapeURL string
 
@@ -42,6 +47,11 @@ type ScrapeWork struct {
 	// How to deal with scraped timestamps.
 	// See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#scrape_config
 	HonorTimestamps bool
+
+	// OriginalLabels contains original labels before relabeling.
+	//
+	// These labels are needed for relabeling troubleshooting at /targets page.
+	OriginalLabels []prompbmarshal.Label
 
 	// Labels to add to the scraped metrics.
 	//
@@ -61,6 +71,9 @@ type ScrapeWork struct {
 	// Auth config
 	AuthConfig *promauth.Config
 
+	// ProxyURL HTTP proxy url
+	ProxyURL proxy.URL
+
 	// Optional `metric_relabel_configs`.
 	MetricRelabelConfigs []promrelabel.ParsedRelabelConfig
 
@@ -73,18 +86,22 @@ type ScrapeWork struct {
 	// Whether to disable HTTP keep-alive when querying ScrapeURL.
 	DisableKeepAlive bool
 
+	// Whether to parse target responses in a streaming manner.
+	StreamParse bool
+
 	// The original 'job_name'
 	jobNameOriginal string
 }
 
 // key returns unique identifier for the given sw.
 //
-// it can be used for comparing for equality two ScrapeWork objects.
+// it can be used for comparing for equality for two ScrapeWork objects.
 func (sw *ScrapeWork) key() string {
+	// Do not take into account OriginalLabels.
 	key := fmt.Sprintf("ScrapeURL=%s, ScrapeInterval=%s, ScrapeTimeout=%s, HonorLabels=%v, HonorTimestamps=%v, Labels=%s, "+
-		"AuthConfig=%s, MetricRelabelConfigs=%s, SampleLimit=%d, DisableCompression=%v, DisableKeepAlive=%v",
+		"AuthConfig=%s, MetricRelabelConfigs=%s, SampleLimit=%d, DisableCompression=%v, DisableKeepAlive=%v, StreamParse=%v",
 		sw.ScrapeURL, sw.ScrapeInterval, sw.ScrapeTimeout, sw.HonorLabels, sw.HonorTimestamps, sw.LabelsString(),
-		sw.AuthConfig.String(), sw.metricRelabelConfigsString(), sw.SampleLimit, sw.DisableCompression, sw.DisableKeepAlive)
+		sw.AuthConfig.String(), sw.metricRelabelConfigsString(), sw.SampleLimit, sw.DisableCompression, sw.DisableKeepAlive, sw.StreamParse)
 	return key
 }
 
@@ -103,19 +120,40 @@ func (sw *ScrapeWork) Job() string {
 
 // LabelsString returns labels in Prometheus format for the given sw.
 func (sw *ScrapeWork) LabelsString() string {
-	labels := make([]string, 0, len(sw.Labels))
-	for _, label := range promrelabel.FinalizeLabels(nil, sw.Labels) {
-		labels = append(labels, fmt.Sprintf("%s=%q", label.Name, label.Value))
+	labelsFinalized := promrelabel.FinalizeLabels(nil, sw.Labels)
+	return promLabelsString(labelsFinalized)
+}
+
+func promLabelsString(labels []prompbmarshal.Label) string {
+	// Calculate the required memory for storing serialized labels.
+	n := 2 // for `{...}`
+	for _, label := range labels {
+		n += len(label.Name) + len(label.Value)
+		n += 4 // for `="...",`
 	}
-	return "{" + strings.Join(labels, ", ") + "}"
+	b := make([]byte, 0, n)
+	b = append(b, '{')
+	for i, label := range labels {
+		b = append(b, label.Name...)
+		b = append(b, '=')
+		b = strconv.AppendQuote(b, label.Value)
+		if i+1 < len(labels) {
+			b = append(b, ',')
+		}
+	}
+	b = append(b, '}')
+	return bytesutil.ToUnsafeString(b)
 }
 
 type scrapeWork struct {
 	// Config for the scrape.
-	Config ScrapeWork
+	Config *ScrapeWork
 
 	// ReadData is called for reading the data.
 	ReadData func(dst []byte) ([]byte, error)
+
+	// GetStreamReader is called if Config.StreamParse is set.
+	GetStreamReader func() (*streamReader, error)
 
 	// PushData is called for pushing collected data.
 	PushData func(wr *prompbmarshal.WriteRequest)
@@ -124,13 +162,20 @@ type scrapeWork struct {
 	// scrapeWork belongs to
 	ScrapeGroup string
 
-	bodyBuf []byte
-	rows    parser.Rows
-	tmpRow  parser.Row
+	tmpRow parser.Row
 
-	writeRequest prompbmarshal.WriteRequest
-	labels       []prompbmarshal.Label
-	samples      []prompbmarshal.Sample
+	// the seriesMap, seriesAdded and labelsHashBuf are used for fast calculation of `scrape_series_added` metric.
+	seriesMap     map[uint64]struct{}
+	seriesAdded   int
+	labelsHashBuf []byte
+
+	// prevBodyLen contains the previous response body length for the given scrape work.
+	// It is used as a hint in order to reduce memory usage for body buffers.
+	prevBodyLen int
+
+	// prevRowsLen contains the number rows scraped during the previous scrape.
+	// It is used as a hint in order to reduce memory usage when parsing scrape responses.
+	prevRowsLen int
 }
 
 func (sw *scrapeWork) run(stopCh <-chan struct{}) {
@@ -158,7 +203,7 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}) {
 	case <-timer.C:
 		ticker = time.NewTicker(scrapeInterval)
 		timestamp = time.Now().UnixNano() / 1e6
-		sw.scrapeAndLogError(timestamp)
+		sw.scrapeAndLogError(timestamp, timestamp)
 	}
 	defer ticker.Stop()
 	for {
@@ -166,25 +211,27 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}) {
 		select {
 		case <-stopCh:
 			return
-		case <-ticker.C:
-			t := time.Now().UnixNano() / 1e6
-			if d := t - timestamp; d > 0 && float64(d)/float64(scrapeInterval.Milliseconds()) > 0.1 {
+		case tt := <-ticker.C:
+			t := tt.UnixNano() / 1e6
+			if d := math.Abs(float64(t - timestamp)); d > 0 && d/float64(scrapeInterval.Milliseconds()) > 0.1 {
 				// Too big jitter. Adjust timestamp
 				timestamp = t
 			}
-			sw.scrapeAndLogError(timestamp)
+			sw.scrapeAndLogError(timestamp, t)
 		}
 	}
 }
 
 func (sw *scrapeWork) logError(s string) {
 	if !*suppressScrapeErrors {
-		logger.ErrorfSkipframes(1, "error when scraping %q from job %q with labels %s: %s", sw.Config.ScrapeURL, sw.Config.Job(), sw.Config.LabelsString(), s)
+		logger.ErrorfSkipframes(1, "error when scraping %q from job %q with labels %s: %s; "+
+			"scrape errors can be disabled by -promscrape.suppressScrapeErrors command-line flag",
+			sw.Config.ScrapeURL, sw.Config.Job(), sw.Config.LabelsString(), s)
 	}
 }
 
-func (sw *scrapeWork) scrapeAndLogError(timestamp int64) {
-	if err := sw.scrapeInternal(timestamp); err != nil && !*suppressScrapeErrors {
+func (sw *scrapeWork) scrapeAndLogError(scrapeTimestamp, realTimestamp int64) {
+	if err := sw.scrapeInternal(scrapeTimestamp, realTimestamp); err != nil && !*suppressScrapeErrors {
 		logger.Errorf("error when scraping %q from job %q with labels %s: %s", sw.Config.ScrapeURL, sw.Config.Job(), sw.Config.LabelsString(), err)
 	}
 }
@@ -198,85 +245,274 @@ var (
 	pushDataDuration            = metrics.NewHistogram("vm_promscrape_push_data_duration_seconds")
 )
 
-func (sw *scrapeWork) scrapeInternal(timestamp int64) error {
+func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error {
+	if *streamParse || sw.Config.StreamParse {
+		// Read data from scrape targets in streaming manner.
+		// This case is optimized for targets exposing millions and more of metrics per target.
+		return sw.scrapeStream(scrapeTimestamp, realTimestamp)
+	}
+
+	// Common case: read all the data from scrape target to memory (body) and then process it.
+	// This case should work more optimally for than stream parse code above for common case when scrape target exposes
+	// up to a few thousand metrics.
+	body := leveledbytebufferpool.Get(sw.prevBodyLen)
 	var err error
-	sw.bodyBuf, err = sw.ReadData(sw.bodyBuf[:0])
+	body.B, err = sw.ReadData(body.B[:0])
 	endTimestamp := time.Now().UnixNano() / 1e6
-	duration := float64(endTimestamp-timestamp) / 1e3
+	duration := float64(endTimestamp-realTimestamp) / 1e3
 	scrapeDuration.Update(duration)
-	scrapeResponseSize.Update(float64(len(sw.bodyBuf)))
+	scrapeResponseSize.Update(float64(len(body.B)))
 	up := 1
+	wc := writeRequestCtxPool.Get(sw.prevRowsLen)
 	if err != nil {
 		up = 0
 		scrapesFailed.Inc()
 	} else {
-		bodyString := bytesutil.ToUnsafeString(sw.bodyBuf)
-		sw.rows.UnmarshalWithErrLogger(bodyString, sw.logError)
+		bodyString := bytesutil.ToUnsafeString(body.B)
+		wc.rows.UnmarshalWithErrLogger(bodyString, sw.logError)
 	}
-	srcRows := sw.rows.Rows
+	srcRows := wc.rows.Rows
 	samplesScraped := len(srcRows)
 	scrapedSamples.Update(float64(samplesScraped))
-	for i := range srcRows {
-		sw.addRowToTimeseries(&srcRows[i], timestamp, true)
-	}
-	sw.rows.Reset()
-	if sw.Config.SampleLimit > 0 && len(sw.writeRequest.Timeseries) > sw.Config.SampleLimit {
-		prompbmarshal.ResetWriteRequest(&sw.writeRequest)
+	if sw.Config.SampleLimit > 0 && samplesScraped > sw.Config.SampleLimit {
+		srcRows = srcRows[:0]
 		up = 0
 		scrapesSkippedBySampleLimit.Inc()
 	}
-	samplesPostRelabeling := len(sw.writeRequest.Timeseries)
-	sw.addAutoTimeseries("up", float64(up), timestamp)
-	sw.addAutoTimeseries("scrape_duration_seconds", duration, timestamp)
-	sw.addAutoTimeseries("scrape_samples_scraped", float64(samplesScraped), timestamp)
-	sw.addAutoTimeseries("scrape_samples_post_metric_relabeling", float64(samplesPostRelabeling), timestamp)
+	samplesPostRelabeling := 0
+	for i := range srcRows {
+		sw.addRowToTimeseries(wc, &srcRows[i], scrapeTimestamp, true)
+		if len(wc.labels) > 40000 {
+			// Limit the maximum size of wc.writeRequest.
+			// This should reduce memory usage when scraping targets with millions of metrics and/or labels.
+			// For example, when scraping /federate handler from Prometheus - see https://prometheus.io/docs/prometheus/latest/federation/
+			samplesPostRelabeling += len(wc.writeRequest.Timeseries)
+			sw.updateSeriesAdded(wc)
+			startTime := time.Now()
+			sw.PushData(&wc.writeRequest)
+			pushDataDuration.UpdateDuration(startTime)
+			wc.resetNoRows()
+		}
+	}
+	samplesPostRelabeling += len(wc.writeRequest.Timeseries)
+	sw.updateSeriesAdded(wc)
+	seriesAdded := sw.finalizeSeriesAdded(samplesPostRelabeling)
+	sw.addAutoTimeseries(wc, "up", float64(up), scrapeTimestamp)
+	sw.addAutoTimeseries(wc, "scrape_duration_seconds", duration, scrapeTimestamp)
+	sw.addAutoTimeseries(wc, "scrape_samples_scraped", float64(samplesScraped), scrapeTimestamp)
+	sw.addAutoTimeseries(wc, "scrape_samples_post_metric_relabeling", float64(samplesPostRelabeling), scrapeTimestamp)
+	sw.addAutoTimeseries(wc, "scrape_series_added", float64(seriesAdded), scrapeTimestamp)
 	startTime := time.Now()
-	sw.PushData(&sw.writeRequest)
+	sw.PushData(&wc.writeRequest)
 	pushDataDuration.UpdateDuration(startTime)
-	prompbmarshal.ResetWriteRequest(&sw.writeRequest)
-	sw.labels = sw.labels[:0]
-	sw.samples = sw.samples[:0]
-	tsmGlobal.Update(&sw.Config, sw.ScrapeGroup, up == 1, timestamp, int64(duration*1000), err)
+	sw.prevRowsLen = samplesScraped
+	wc.reset()
+	writeRequestCtxPool.Put(wc)
+	// body must be released only after wc is released, since wc refers to body.
+	sw.prevBodyLen = len(body.B)
+	leveledbytebufferpool.Put(body)
+	tsmGlobal.Update(sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), err)
 	return err
+}
+
+func (sw *scrapeWork) scrapeStream(scrapeTimestamp, realTimestamp int64) error {
+	samplesScraped := 0
+	samplesPostRelabeling := 0
+	responseSize := int64(0)
+	wc := writeRequestCtxPool.Get(sw.prevRowsLen)
+
+	sr, err := sw.GetStreamReader()
+	if err != nil {
+		err = fmt.Errorf("cannot read data: %s", err)
+	} else {
+		var mu sync.Mutex
+		err = parser.ParseStream(sr, scrapeTimestamp, false, func(rows []parser.Row) error {
+			mu.Lock()
+			defer mu.Unlock()
+			samplesScraped += len(rows)
+			for i := range rows {
+				sw.addRowToTimeseries(wc, &rows[i], scrapeTimestamp, true)
+			}
+			// Push the collected rows to sw before returning from the callback, since they cannot be held
+			// after returning from the callback - this will result in data race.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/825#issuecomment-723198247
+			samplesPostRelabeling += len(wc.writeRequest.Timeseries)
+			sw.updateSeriesAdded(wc)
+			startTime := time.Now()
+			sw.PushData(&wc.writeRequest)
+			pushDataDuration.UpdateDuration(startTime)
+			wc.resetNoRows()
+			return nil
+		}, sw.logError)
+		responseSize = sr.bytesRead
+		sr.MustClose()
+	}
+
+	scrapedSamples.Update(float64(samplesScraped))
+	endTimestamp := time.Now().UnixNano() / 1e6
+	duration := float64(endTimestamp-realTimestamp) / 1e3
+	scrapeDuration.Update(duration)
+	scrapeResponseSize.Update(float64(responseSize))
+	up := 1
+	if err != nil {
+		if samplesScraped == 0 {
+			up = 0
+		}
+		scrapesFailed.Inc()
+	}
+	seriesAdded := sw.finalizeSeriesAdded(samplesPostRelabeling)
+	sw.addAutoTimeseries(wc, "up", float64(up), scrapeTimestamp)
+	sw.addAutoTimeseries(wc, "scrape_duration_seconds", duration, scrapeTimestamp)
+	sw.addAutoTimeseries(wc, "scrape_samples_scraped", float64(samplesScraped), scrapeTimestamp)
+	sw.addAutoTimeseries(wc, "scrape_samples_post_metric_relabeling", float64(samplesPostRelabeling), scrapeTimestamp)
+	sw.addAutoTimeseries(wc, "scrape_series_added", float64(seriesAdded), scrapeTimestamp)
+	startTime := time.Now()
+	sw.PushData(&wc.writeRequest)
+	pushDataDuration.UpdateDuration(startTime)
+	sw.prevRowsLen = len(wc.rows.Rows)
+	wc.reset()
+	writeRequestCtxPool.Put(wc)
+	tsmGlobal.Update(sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), err)
+	return err
+}
+
+// leveledWriteRequestCtxPool allows reducing memory usage when writeRequesCtx
+// structs contain mixed number of labels.
+//
+// Its logic has been copied from leveledbytebufferpool.
+type leveledWriteRequestCtxPool struct {
+	pools [30]sync.Pool
+}
+
+func (lwp *leveledWriteRequestCtxPool) Get(rowsCapacity int) *writeRequestCtx {
+	id, capacityNeeded := lwp.getPoolIDAndCapacity(rowsCapacity)
+	for i := 0; i < 2; i++ {
+		if id < 0 || id >= len(lwp.pools) {
+			break
+		}
+		if v := lwp.pools[id].Get(); v != nil {
+			return v.(*writeRequestCtx)
+		}
+		id++
+	}
+	return &writeRequestCtx{
+		labels: make([]prompbmarshal.Label, 0, capacityNeeded),
+	}
+}
+
+func (lwp *leveledWriteRequestCtxPool) Put(wc *writeRequestCtx) {
+	capacity := cap(wc.rows.Rows)
+	id, _ := lwp.getPoolIDAndCapacity(capacity)
+	wc.reset()
+	lwp.pools[id].Put(wc)
+}
+
+func (lwp *leveledWriteRequestCtxPool) getPoolIDAndCapacity(size int) (int, int) {
+	size--
+	if size < 0 {
+		size = 0
+	}
+	size >>= 3
+	id := bits.Len(uint(size))
+	if id > len(lwp.pools) {
+		id = len(lwp.pools) - 1
+	}
+	return id, (1 << (id + 3))
+}
+
+type writeRequestCtx struct {
+	rows         parser.Rows
+	writeRequest prompbmarshal.WriteRequest
+	labels       []prompbmarshal.Label
+	samples      []prompbmarshal.Sample
+}
+
+func (wc *writeRequestCtx) reset() {
+	wc.rows.Reset()
+	wc.resetNoRows()
+}
+
+func (wc *writeRequestCtx) resetNoRows() {
+	prompbmarshal.ResetWriteRequest(&wc.writeRequest)
+	wc.labels = wc.labels[:0]
+	wc.samples = wc.samples[:0]
+}
+
+var writeRequestCtxPool leveledWriteRequestCtxPool
+
+func (sw *scrapeWork) updateSeriesAdded(wc *writeRequestCtx) {
+	if sw.seriesMap == nil {
+		sw.seriesMap = make(map[uint64]struct{}, len(wc.writeRequest.Timeseries))
+	}
+	m := sw.seriesMap
+	for _, ts := range wc.writeRequest.Timeseries {
+		h := sw.getLabelsHash(ts.Labels)
+		if _, ok := m[h]; !ok {
+			m[h] = struct{}{}
+			sw.seriesAdded++
+		}
+	}
+}
+
+func (sw *scrapeWork) finalizeSeriesAdded(lastScrapeSize int) int {
+	seriesAdded := sw.seriesAdded
+	sw.seriesAdded = 0
+	if len(sw.seriesMap) > 4*lastScrapeSize {
+		// Reset seriesMap, since it occupies more than 4x metrics collected during the last scrape.
+		sw.seriesMap = make(map[uint64]struct{}, lastScrapeSize)
+	}
+	return seriesAdded
+}
+
+func (sw *scrapeWork) getLabelsHash(labels []prompbmarshal.Label) uint64 {
+	// It is OK if there will be hash collisions for distinct sets of labels,
+	// since the accuracy for `scrape_series_added` metric may be lower than 100%.
+	b := sw.labelsHashBuf[:0]
+	for _, label := range labels {
+		b = append(b, label.Name...)
+		b = append(b, label.Value...)
+	}
+	sw.labelsHashBuf = b
+	return xxhash.Sum64(b)
 }
 
 // addAutoTimeseries adds automatically generated time series with the given name, value and timestamp.
 //
 // See https://prometheus.io/docs/concepts/jobs_instances/#automatically-generated-labels-and-time-series
-func (sw *scrapeWork) addAutoTimeseries(name string, value float64, timestamp int64) {
+func (sw *scrapeWork) addAutoTimeseries(wc *writeRequestCtx, name string, value float64, timestamp int64) {
 	sw.tmpRow.Metric = name
 	sw.tmpRow.Tags = nil
 	sw.tmpRow.Value = value
 	sw.tmpRow.Timestamp = timestamp
-	sw.addRowToTimeseries(&sw.tmpRow, timestamp, false)
+	sw.addRowToTimeseries(wc, &sw.tmpRow, timestamp, false)
 }
 
-func (sw *scrapeWork) addRowToTimeseries(r *parser.Row, timestamp int64, needRelabel bool) {
-	labelsLen := len(sw.labels)
-	sw.labels = appendLabels(sw.labels, r.Metric, r.Tags, sw.Config.Labels, sw.Config.HonorLabels)
+func (sw *scrapeWork) addRowToTimeseries(wc *writeRequestCtx, r *parser.Row, timestamp int64, needRelabel bool) {
+	labelsLen := len(wc.labels)
+	wc.labels = appendLabels(wc.labels, r.Metric, r.Tags, sw.Config.Labels, sw.Config.HonorLabels)
 	if needRelabel {
-		sw.labels = promrelabel.ApplyRelabelConfigs(sw.labels, labelsLen, sw.Config.MetricRelabelConfigs, true)
+		wc.labels = promrelabel.ApplyRelabelConfigs(wc.labels, labelsLen, sw.Config.MetricRelabelConfigs, true)
 	} else {
-		sw.labels = promrelabel.FinalizeLabels(sw.labels[:labelsLen], sw.labels[labelsLen:])
-		promrelabel.SortLabels(sw.labels[labelsLen:])
+		wc.labels = promrelabel.FinalizeLabels(wc.labels[:labelsLen], wc.labels[labelsLen:])
+		promrelabel.SortLabels(wc.labels[labelsLen:])
 	}
-	if len(sw.labels) == labelsLen {
+	if len(wc.labels) == labelsLen {
 		// Skip row without labels.
 		return
 	}
-	labels := sw.labels[labelsLen:]
-	sw.samples = append(sw.samples, prompbmarshal.Sample{})
-	sample := &sw.samples[len(sw.samples)-1]
-	sample.Value = r.Value
-	sample.Timestamp = r.Timestamp
-	if !sw.Config.HonorTimestamps || sample.Timestamp == 0 {
-		sample.Timestamp = timestamp
+	sampleTimestamp := r.Timestamp
+	if !sw.Config.HonorTimestamps || sampleTimestamp == 0 {
+		sampleTimestamp = timestamp
 	}
-	wr := &sw.writeRequest
-	wr.Timeseries = append(wr.Timeseries, prompbmarshal.TimeSeries{})
-	ts := &wr.Timeseries[len(wr.Timeseries)-1]
-	ts.Labels = labels
-	ts.Samples = sw.samples[len(sw.samples)-1:]
+	wc.samples = append(wc.samples, prompbmarshal.Sample{
+		Value:     r.Value,
+		Timestamp: sampleTimestamp,
+	})
+	wr := &wc.writeRequest
+	wr.Timeseries = append(wr.Timeseries, prompbmarshal.TimeSeries{
+		Labels:  wc.labels[labelsLen:],
+		Samples: wc.samples[len(wc.samples)-1:],
+	})
 }
 
 func appendLabels(dst []prompbmarshal.Label, metric string, src []parser.Tag, extraLabels []prompbmarshal.Label, honorLabels bool) []prompbmarshal.Label {

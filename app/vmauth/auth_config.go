@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envtemplate"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	"github.com/VictoriaMetrics/metrics"
@@ -16,7 +17,7 @@ import (
 )
 
 var (
-	authConfigPath = flag.String("auth.config", "", "Path to auth config. See https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/app/vmauth/README.md "+
+	authConfigPath = flag.String("auth.config", "", "Path to auth config. See https://victoriametrics.github.io/vmauth.html "+
 		"for details on the format of this auth config")
 )
 
@@ -93,6 +94,7 @@ func readAuthConfig(path string) (map[string]*UserInfo, error) {
 }
 
 func parseAuthConfig(data []byte) (map[string]*UserInfo, error) {
+	data = envtemplate.Replace(data)
 	var ac AuthConfig
 	if err := yaml.UnmarshalStrict(data, &ac); err != nil {
 		return nil, fmt.Errorf("cannot unmarshal AuthConfig data: %w", err)

@@ -27,7 +27,8 @@ type PrepareBlockCallback func(data []byte, items [][]byte) ([]byte, [][]byte)
 // The function immediately returns when stopCh is closed.
 //
 // It also atomically adds the number of items merged to itemsMerged.
-func mergeBlockStreams(ph *partHeader, bsw *blockStreamWriter, bsrs []*blockStreamReader, prepareBlock PrepareBlockCallback, stopCh <-chan struct{}, itemsMerged *uint64) error {
+func mergeBlockStreams(ph *partHeader, bsw *blockStreamWriter, bsrs []*blockStreamReader, prepareBlock PrepareBlockCallback, stopCh <-chan struct{},
+	itemsMerged *uint64) error {
 	bsm := bsmPool.Get().(*blockStreamMerger)
 	if err := bsm.Init(bsrs, prepareBlock); err != nil {
 		return fmt.Errorf("cannot initialize blockStreamMerger: %w", err)
@@ -38,9 +39,6 @@ func mergeBlockStreams(ph *partHeader, bsw *blockStreamWriter, bsrs []*blockStre
 	bsw.MustClose()
 	if err == nil {
 		return nil
-	}
-	if err == errForciblyStopped {
-		return err
 	}
 	return fmt.Errorf("cannot merge %d block streams: %s: %w", len(bsrs), bsrs, err)
 }

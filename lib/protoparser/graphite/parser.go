@@ -35,7 +35,7 @@ func (rs *Rows) Reset() {
 //
 // See https://graphite.readthedocs.io/en/latest/feeding-carbon.html#the-plaintext-protocol
 //
-// s must be unchanged until rs is in use.
+// s shouldn't be modified when rs is in use.
 func (rs *Rows) Unmarshal(s string) {
 	rs.Rows, rs.tagsPool = unmarshalRows(rs.Rows[:0], s, rs.tagsPool[:0])
 }
@@ -55,25 +55,21 @@ func (r *Row) reset() {
 	r.Timestamp = 0
 }
 
-func (r *Row) unmarshal(s string, tagsPool []Tag) ([]Tag, error) {
-	r.reset()
-	n := strings.IndexByte(s, ' ')
-	if n < 0 {
-		return tagsPool, fmt.Errorf("cannot find whitespace between metric and value in %q", s)
+// UnmarshalMetricAndTags unmarshals metric and optional tags from s.
+func (r *Row) UnmarshalMetricAndTags(s string, tagsPool []Tag) ([]Tag, error) {
+	if strings.Contains(s, " ") {
+		return tagsPool, fmt.Errorf("unexpected whitespace found in %q", s)
 	}
-	metricAndTags := s[:n]
-	tail := s[n+1:]
-
-	n = strings.IndexByte(metricAndTags, ';')
+	n := strings.IndexByte(s, ';')
 	if n < 0 {
 		// No tags
-		r.Metric = metricAndTags
+		r.Metric = s
 	} else {
 		// Tags found
-		r.Metric = metricAndTags[:n]
+		r.Metric = s[:n]
 		tagsStart := len(tagsPool)
 		var err error
-		tagsPool, err = unmarshalTags(tagsPool, metricAndTags[n+1:])
+		tagsPool, err = unmarshalTags(tagsPool, s[n+1:])
 		if err != nil {
 			return tagsPool, fmt.Errorf("cannot umarshal tags: %w", err)
 		}
@@ -83,15 +79,43 @@ func (r *Row) unmarshal(s string, tagsPool []Tag) ([]Tag, error) {
 	if len(r.Metric) == 0 {
 		return tagsPool, fmt.Errorf("metric cannot be empty")
 	}
+	return tagsPool, nil
+}
+
+func (r *Row) unmarshal(s string, tagsPool []Tag) ([]Tag, error) {
+	r.reset()
+	n := strings.IndexByte(s, ' ')
+	if n < 0 {
+		return tagsPool, fmt.Errorf("cannot find whitespace between metric and value in %q", s)
+	}
+	metricAndTags := s[:n]
+	tail := s[n+1:]
+
+	tagsPool, err := r.UnmarshalMetricAndTags(metricAndTags, tagsPool)
+	if err != nil {
+		return tagsPool, err
+	}
 
 	n = strings.IndexByte(tail, ' ')
 	if n < 0 {
 		// There is no timestamp. Use default timestamp instead.
-		r.Value = fastfloat.ParseBestEffort(tail)
+		v, err := fastfloat.Parse(tail)
+		if err != nil {
+			return tagsPool, fmt.Errorf("cannot unmarshal value from %q: %w", tail, err)
+		}
+		r.Value = v
 		return tagsPool, nil
 	}
-	r.Value = fastfloat.ParseBestEffort(tail[:n])
-	r.Timestamp = fastfloat.ParseInt64BestEffort(tail[n+1:])
+	v, err := fastfloat.Parse(tail[:n])
+	if err != nil {
+		return tagsPool, fmt.Errorf("cannot unmarshal value from %q: %w", tail[:n], err)
+	}
+	ts, err := fastfloat.Parse(tail[n+1:])
+	if err != nil {
+		return tagsPool, fmt.Errorf("cannot unmarshal timestamp from %q: %w", tail[n+1:], err)
+	}
+	r.Value = v
+	r.Timestamp = int64(ts)
 	return tagsPool, nil
 }
 

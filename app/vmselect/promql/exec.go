@@ -5,17 +5,25 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/querystats"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/VictoriaMetrics/metricsql"
 )
 
-var logSlowQueryDuration = flag.Duration("search.logSlowQueryDuration", 5*time.Second, "Log queries with execution time exceeding this value. Zero disables slow query logging")
+var (
+	logSlowQueryDuration   = flag.Duration("search.logSlowQueryDuration", 5*time.Second, "Log queries with execution time exceeding this value. Zero disables slow query logging")
+	treatDotsAsIsInRegexps = flag.Bool("search.treatDotsAsIsInRegexps", false, "Whether to treat dots as is in regexp label filters used in queries. "+
+		`For example, foo{bar=~"a.b.c"} will be automatically converted to foo{bar=~"a\\.b\\.c"}, i.e. all the dots in regexp filters will be automatically escaped `+
+		`in order to match only dot char instead of matching any char. Dots in ".+", ".*" and ".{n}" regexps aren't escaped. `+
+		`Such escaping can be useful when querying Graphite data`)
+)
 
 var slowQueries = metrics.NewCounter(`vm_slow_queries_total`)
 
@@ -26,11 +34,15 @@ func Exec(ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result,
 		defer func() {
 			d := time.Since(startTime)
 			if d >= *logSlowQueryDuration {
-				logger.Infof("slow query according to -search.logSlowQueryDuration=%s: duration=%.3f seconds, start=%d, end=%d, step=%d, query=%q",
-					*logSlowQueryDuration, d.Seconds(), ec.Start/1000, ec.End/1000, ec.Step/1000, q)
+				logger.Warnf("slow query according to -search.logSlowQueryDuration=%s: remoteAddr=%s, duration=%.3f seconds, start=%d, end=%d, step=%d, query=%q",
+					*logSlowQueryDuration, ec.QuotedRemoteAddr, d.Seconds(), ec.Start/1000, ec.End/1000, ec.Step/1000, q)
 				slowQueries.Inc()
 			}
 		}()
+	}
+	if querystats.Enabled() {
+		startTime := time.Now()
+		defer querystats.RegisterQuery(q, ec.End-ec.Start, startTime)
 	}
 
 	ec.validate()
@@ -133,10 +145,70 @@ func removeNaNs(tss []*timeseries) []*timeseries {
 	return rvs
 }
 
+func adjustCmpOps(e metricsql.Expr) metricsql.Expr {
+	metricsql.VisitAll(e, func(expr metricsql.Expr) {
+		be, ok := expr.(*metricsql.BinaryOpExpr)
+		if !ok {
+			return
+		}
+		if !metricsql.IsBinaryOpCmp(be.Op) {
+			return
+		}
+		if isNumberExpr(be.Right) || !isScalarExpr(be.Left) {
+			return
+		}
+		// Convert 'num cmpOp query' expression to `query reverseCmpOp num` expression
+		// like Prometheus does. For instance, `0.5 < foo` must be converted to `foo > 0.5`
+		// in order to return valid values for `foo` that are bigger than 0.5.
+		be.Right, be.Left = be.Left, be.Right
+		be.Op = getReverseCmpOp(be.Op)
+	})
+	return e
+}
+
+func isNumberExpr(e metricsql.Expr) bool {
+	_, ok := e.(*metricsql.NumberExpr)
+	return ok
+}
+
+func isScalarExpr(e metricsql.Expr) bool {
+	if isNumberExpr(e) {
+		return true
+	}
+	if fe, ok := e.(*metricsql.FuncExpr); ok {
+		// time() returns scalar in PromQL - see https://prometheus.io/docs/prometheus/latest/querying/functions/#time
+		return strings.ToLower(fe.Name) == "time"
+	}
+	return false
+}
+
+func getReverseCmpOp(op string) string {
+	switch op {
+	case ">":
+		return "<"
+	case "<":
+		return ">"
+	case ">=":
+		return "<="
+	case "<=":
+		return ">="
+	default:
+		// there is no need in changing `==` and `!=`.
+		return op
+	}
+}
+
 func parsePromQLWithCache(q string) (metricsql.Expr, error) {
 	pcv := parseCacheV.Get(q)
 	if pcv == nil {
 		e, err := metricsql.Parse(q)
+		if err == nil {
+			e = metricsql.Optimize(e)
+			e = adjustCmpOps(e)
+			if *treatDotsAsIsInRegexps {
+				e = escapeDotsInRegexpLabelFilters(e)
+			}
+		}
 		pcv = &parseCacheValue{
 			e:   e,
 			err: err,
@@ -147,6 +219,41 @@ func parsePromQLWithCache(q string) (metricsql.Expr, error) {
 		return nil, pcv.err
 	}
 	return pcv.e, nil
+}
+
+func escapeDotsInRegexpLabelFilters(e metricsql.Expr) metricsql.Expr {
+	metricsql.VisitAll(e, func(expr metricsql.Expr) {
+		me, ok := expr.(*metricsql.MetricExpr)
+		if !ok {
+			return
+		}
+		for i := range me.LabelFilters {
+			f := &me.LabelFilters[i]
+			if f.IsRegexp {
+				f.Value = escapeDots(f.Value)
+			}
+		}
+	})
+	return e
+}
+
+func escapeDots(s string) string {
+	dotsCount := strings.Count(s, ".")
+	if dotsCount <= 0 {
+		return s
+	}
+	result := make([]byte, 0, len(s)+2*dotsCount)
+	for i := 0; i < len(s); i++ {
+		if s[i] == '.' && (i == 0 || s[i-1] != '\\') && (i+1 == len(s) || i+1 < len(s) && s[i+1] != '*' && s[i+1] != '+' && s[i+1] != '{') {
+			// Escape a dot if the following conditions are met:
+			// - if it isn't escaped already, i.e. if there is no `\` char before the dot.
+			// - if there is no regexp modifiers such as '+', '*' or '{' after the dot.
+			result = append(result, '\\', '.')
+		} else {
+			result = append(result, s[i])
+		}
+	}
+	return string(result)
 }
 
 var parseCacheV = func() *parseCache {

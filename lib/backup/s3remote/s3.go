@@ -45,6 +45,8 @@ type FS struct {
 }
 
 // Init initializes fs.
+//
+// The returned fs must be stopped when no long needed with MustStop call.
 func (fs *FS) Init() error {
 	if fs.s3 != nil {
 		logger.Panicf("BUG: Init is already called")
@@ -80,7 +82,7 @@ func (fs *FS) Init() error {
 	} else {
 		// Determine bucket region.
 		ctx := context.Background()
-		region, err := s3manager.GetBucketRegion(ctx, sess, fs.Bucket, "")
+		region, err := s3manager.GetBucketRegion(ctx, sess, fs.Bucket, "us-west-2")
 		if err != nil {
 			return fmt.Errorf("cannot determine region for bucket %q: %w", fs.Bucket, err)
 		}
@@ -94,6 +96,12 @@ func (fs *FS) Init() error {
 		u.Concurrency = 1
 	})
 	return nil
+}
+
+// MustStop stops fs.
+func (fs *FS) MustStop() {
+	fs.s3 = nil
+	fs.uploader = nil
 }
 
 // String returns human-readable description for fs.

@@ -111,6 +111,15 @@ func TestRowsUnmarshalFailure(t *testing.T) {
 
 	// Invalid timestamp
 	f("foo bar=123 baz")
+
+	// Invalid field value
+	f("foo bar=1abci")
+	f("foo bar=-2abci")
+	f("foo bar=3abcu")
+
+	// HTTP request line
+	f("GET /foo HTTP/1.1")
+	f("GET /foo?bar=baz HTTP/1.0")
 }
 
 func TestRowsUnmarshalSuccess(t *testing.T) {
@@ -457,6 +466,36 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 				}},
 			},
 		},
+	})
+
+	// Superfluous whitespace between tags, fields and timestamps.
+	f(`cpu_utilization,host=mnsbook-pro.local value=119.8 1607222595591`, &Rows{
+		Rows: []Row{{
+			Measurement: "cpu_utilization",
+			Tags: []Tag{{
+				Key:   "host",
+				Value: "mnsbook-pro.local",
+			}},
+			Fields: []Field{{
+				Key:   "value",
+				Value: 119.8,
+			}},
+			Timestamp: 1607222595591,
+		}},
+	})
+	f(`cpu_utilization,host=mnsbook-pro.local   value=119.8   1607222595591`, &Rows{
+		Rows: []Row{{
+			Measurement: "cpu_utilization",
+			Tags: []Tag{{
+				Key:   "host",
+				Value: "mnsbook-pro.local",
+			}},
+			Fields: []Field{{
+				Key:   "value",
+				Value: 119.8,
+			}},
+			Timestamp: 1607222595591,
+		}},
 	})
 
 	f("x,y=z,g=p:\\ \\ 5432\\,\\ gp\\ mon\\ [lol]\\ con10\\ cmd5\\ SELECT f=1", &Rows{

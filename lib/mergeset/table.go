@@ -1,11 +1,11 @@
 package mergeset
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -13,10 +13,12 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storagepacelimiter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/syncwg"
 )
 
@@ -337,11 +339,11 @@ func (tb *Table) UpdateMetrics(m *TableMetrics) {
 	}
 	tb.partsLock.Unlock()
 
-	m.DataBlocksCacheRequests += atomic.LoadUint64(&historicalDataBlockCacheRequests)
-	m.DataBlocksCacheMisses += atomic.LoadUint64(&historicalDataBlockCacheMisses)
+	m.DataBlocksCacheRequests = atomic.LoadUint64(&historicalDataBlockCacheRequests)
+	m.DataBlocksCacheMisses = atomic.LoadUint64(&historicalDataBlockCacheMisses)
 
-	m.IndexBlocksCacheRequests += atomic.LoadUint64(&historicalIndexBlockCacheRequests)
-	m.IndexBlocksCacheMisses += atomic.LoadUint64(&historicalIndexBlockCacheMisses)
+	m.IndexBlocksCacheRequests = atomic.LoadUint64(&historicalIndexBlockCacheRequests)
+	m.IndexBlocksCacheMisses = atomic.LoadUint64(&historicalIndexBlockCacheMisses)
 }
 
 // AddItems adds the given items to the tb.
@@ -367,7 +369,7 @@ func (tb *Table) AddItems(items [][]byte) error {
 			tb.rawItemsBlocks = append(tb.rawItemsBlocks, ib)
 		}
 	}
-	if len(tb.rawItemsBlocks) >= 1024 {
+	if len(tb.rawItemsBlocks) >= 512 {
 		blocksToMerge = tb.rawItemsBlocks
 		tb.rawItemsBlocks = nil
 		tb.rawItemsLastFlushTime = fasttime.UnixTimestamp()
@@ -479,16 +481,27 @@ func (tb *Table) convertToV1280() {
 }
 
 func (tb *Table) mergePartsOptimal(pws []*partWrapper, stopCh <-chan struct{}) error {
+	defer func() {
+		// Remove isInMerge flag from pws.
+		tb.partsLock.Lock()
+		for _, pw := range pws {
+			// Do not check for pws.isInMerge set to false,
+			// since it may be set to false in mergeParts below.
+			pw.isInMerge = false
+		}
+		tb.partsLock.Unlock()
+	}()
 	for len(pws) > defaultPartsToMerge {
 		if err := tb.mergeParts(pws[:defaultPartsToMerge], stopCh, false); err != nil {
 			return fmt.Errorf("cannot merge %d parts: %w", defaultPartsToMerge, err)
 		}
 		pws = pws[defaultPartsToMerge:]
 	}
-	if len(pws) > 0 {
-		if err := tb.mergeParts(pws, stopCh, false); err != nil {
-			return fmt.Errorf("cannot merge %d parts: %w", len(pws), err)
-		}
+	if len(pws) == 0 {
+		return nil
+	}
+	if err := tb.mergeParts(pws, stopCh, false); err != nil {
+		return fmt.Errorf("cannot merge %d parts: %w", len(pws), err)
 	}
 	return nil
 }
@@ -566,12 +579,16 @@ func (tb *Table) mergeRawItemsBlocks(blocksToMerge []*inmemoryBlock) {
 		}
 
 		// The added part exceeds maxParts count. Assist with merging other parts.
+		//
+		// Prioritize assisted merges over searches.
+		storagepacelimiter.Search.Inc()
 		err := tb.mergeExistingParts(false)
+		storagepacelimiter.Search.Dec()
 		if err == nil {
 			atomic.AddUint64(&tb.assistedMerges, 1)
 			continue
 		}
-		if err == errNothingToMerge || err == errForciblyStopped {
+		if errors.Is(err, errNothingToMerge) || errors.Is(err, errForciblyStopped) {
 			return
 		}
 		logger.Panicf("FATAL: cannot merge small parts: %s", err)
@@ -630,7 +647,8 @@ func (tb *Table) mergeInmemoryBlocks(blocksToMerge []*inmemoryBlock) *partWrappe
 	// Merge parts.
 	// The merge shouldn't be interrupted by stopCh,
 	// since it may be final after stopCh is closed.
-	if err := mergeBlockStreams(&mpDst.ph, bsw, bsrs, tb.prepareBlock, nil, &tb.itemsMerged); err != nil {
+	err := mergeBlockStreams(&mpDst.ph, bsw, bsrs, tb.prepareBlock, nil, &tb.itemsMerged)
+	if err != nil {
 		logger.Panicf("FATAL: cannot merge inmemoryBlocks: %s", err)
 	}
 	putBlockStreamWriter(bsw)
@@ -690,11 +708,11 @@ func (tb *Table) partMerger() error {
 			isFinal = false
 			continue
 		}
-		if err == errForciblyStopped {
+		if errors.Is(err, errForciblyStopped) {
 			// The merger has been stopped.
 			return nil
 		}
-		if err != errNothingToMerge {
+		if !errors.Is(err, errNothingToMerge) {
 			return err
 		}
 		if fasttime.UnixTimestamp()-lastMergeTime > 30 {
@@ -721,6 +739,11 @@ func (tb *Table) partMerger() error {
 
 var errNothingToMerge = fmt.Errorf("nothing to merge")
 
+// mergeParts merges pws.
+//
+// Merging is immediately stopped if stopCh is closed.
+//
+// All the parts inside pws must have isInMerge field set to true.
 func (tb *Table) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isOuterParts bool) error {
 	if len(pws) == 0 {
 		// Nothing to merge.
@@ -794,9 +817,6 @@ func (tb *Table) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isOuterP
 	err := mergeBlockStreams(&ph, bsw, bsrs, tb.prepareBlock, stopCh, &tb.itemsMerged)
 	putBlockStreamWriter(bsw)
 	if err != nil {
-		if err == errForciblyStopped {
-			return err
-		}
 		return fmt.Errorf("error when merging parts to %q: %w", tmpPartPath, err)
 	}
 	if err := ph.WriteMetadata(tmpPartPath); err != nil {
@@ -939,9 +959,7 @@ func (tb *Table) maxOutPartItemsSlow() uint64 {
 	return freeSpace / uint64(mergeWorkersCount) / 4
 }
 
-var mergeWorkersCount = func() int {
-	return runtime.GOMAXPROCS(-1)
-}()
+var mergeWorkersCount = cgroup.AvailableCPUs()
 
 func openParts(path string) ([]*partWrapper, error) {
 	// The path can be missing after restoring from backup, so create it if needed.
@@ -1136,7 +1154,7 @@ func runTransactions(txnLock *sync.RWMutex, path string) error {
 }
 
 func runTransaction(txnLock *sync.RWMutex, pathPrefix, txnPath string) error {
-	// The transaction must be run under read lock in order to provide
+	// The transaction must run under read lock in order to provide
 	// consistent snapshots with Table.CreateSnapshot().
 	txnLock.RLock()
 	defer txnLock.RUnlock()
@@ -1287,21 +1305,35 @@ func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxItems u
 	// Sort src parts by itemsCount.
 	sort.Slice(src, func(i, j int) bool { return src[i].p.ph.itemsCount < src[j].p.ph.itemsCount })
 
-	n := maxPartsToMerge
-	if len(src) < n {
-		n = len(src)
+	minSrcParts := (maxPartsToMerge + 1) / 2
+	if minSrcParts < 2 {
+		minSrcParts = 2
+	}
+	maxSrcParts := maxPartsToMerge
+	if len(src) < maxSrcParts {
+		maxSrcParts = len(src)
 	}
 
-	// Exhaustive search for parts giving the lowest write amplification
-	// when merged.
+	// Exhaustive search for parts giving the lowest write amplification when merged.
 	var pws []*partWrapper
 	maxM := float64(0)
-	for i := 2; i <= n; i++ {
+	for i := minSrcParts; i <= maxSrcParts; i++ {
 		for j := 0; j <= len(src)-i; j++ {
-			itemsSum := uint64(0)
 			a := src[j : j+i]
+			if a[0].p.ph.itemsCount*uint64(len(a)) < a[len(a)-1].p.ph.itemsCount {
+				// Do not merge parts with too big difference in items count,
+				// since this results in unbalanced merges.
+				continue
+			}
+			itemsSum := uint64(0)
 			for _, pw := range a {
 				itemsSum += pw.p.ph.itemsCount
+			}
+			if itemsSum < 1e6 && len(a) < maxPartsToMerge {
+				// Do not merge parts with too small number of items if the number of source parts
+				// isn't equal to maxPartsToMerge. This should reduce CPU usage and disk IO usage
+				// for small parts merge.
+				continue
 			}
 			if itemsSum > maxItems {
 				// There is no sense in checking the remaining bigger parts.
@@ -1331,15 +1363,15 @@ func removeParts(pws []*partWrapper, partsToRemove map[*partWrapper]bool) ([]*pa
 	removedParts := 0
 	dst := pws[:0]
 	for _, pw := range pws {
-		if partsToRemove[pw] {
-			atomic.AddUint64(&historicalDataBlockCacheRequests, pw.p.ibCache.Requests())
-			atomic.AddUint64(&historicalDataBlockCacheMisses, pw.p.ibCache.Misses())
-			atomic.AddUint64(&historicalIndexBlockCacheRequests, pw.p.idxbCache.Requests())
-			atomic.AddUint64(&historicalIndexBlockCacheMisses, pw.p.idxbCache.Misses())
-			removedParts++
+		if !partsToRemove[pw] {
+			dst = append(dst, pw)
 			continue
 		}
-		dst = append(dst, pw)
+		atomic.AddUint64(&historicalDataBlockCacheRequests, pw.p.ibCache.Requests())
+		atomic.AddUint64(&historicalDataBlockCacheMisses, pw.p.ibCache.Misses())
+		atomic.AddUint64(&historicalIndexBlockCacheRequests, pw.p.idxbCache.Requests())
+		atomic.AddUint64(&historicalIndexBlockCacheMisses, pw.p.idxbCache.Misses())
+		removedParts++
 	}
 	return dst, removedParts
 }

@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v2"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 )
 
@@ -41,7 +43,7 @@ func TestParseBad(t *testing.T) {
 		},
 		{
 			[]string{"testdata/dir/rules2-bad.rules"},
-			"function \"value\" not defined",
+			"function \"unknown\" not defined",
 		},
 		{
 			[]string{"testdata/dir/rules3-bad.rules"},
@@ -50,10 +52,6 @@ func TestParseBad(t *testing.T) {
 		{
 			[]string{"testdata/dir/rules4-bad.rules"},
 			"either `record` or `alert` must be set",
-		},
-		{
-			[]string{"testdata/*.yaml"},
-			"no groups found",
 		},
 	}
 	for _, tc := range testCases {
@@ -140,12 +138,14 @@ func TestGroup_Validate(t *testing.T) {
 						Alert: "alert",
 						Expr:  "up == 1",
 						Labels: map[string]string{
-							"summary": "{{ value|query }}",
+							"summary": `
+{{ with printf "node_memory_MemTotal{job='node',instance='%s'}" "localhost" | query }}
+  {{ . | first | value | humanize1024 }}B
+{{ end }}`,
 						},
 					},
 				},
 			},
-			expErr:              "error parsing annotation",
 			validateAnnotations: true,
 		},
 		{
@@ -273,7 +273,7 @@ func TestHashRule(t *testing.T) {
 			true,
 		},
 		{
-			Rule{Alert: "alert", Expr: "up == 1", For: time.Minute},
+			Rule{Alert: "alert", Expr: "up == 1", For: NewPromDuration(time.Minute)},
 			Rule{Alert: "alert", Expr: "up == 1"},
 			true,
 		},
@@ -323,4 +323,58 @@ func TestHashRule(t *testing.T) {
 			t.Fatalf("missmatch for rule %d", i)
 		}
 	}
+}
+
+func TestGroupChecksum(t *testing.T) {
+	f := func(t *testing.T, data, newData string) {
+		t.Helper()
+		var g Group
+		if err := yaml.Unmarshal([]byte(data), &g); err != nil {
+			t.Fatalf("failed to unmarshal: %s", err)
+		}
+		if g.Checksum == "" {
+			t.Fatalf("expected to get non-empty checksum")
+		}
+
+		var ng Group
+		if err := yaml.Unmarshal([]byte(newData), &ng); err != nil {
+			t.Fatalf("failed to unmarshal: %s", err)
+		}
+		if g.Checksum == ng.Checksum {
+			t.Fatalf("expected to get different checksums")
+		}
+	}
+	t.Run("Ok", func(t *testing.T) {
+		f(t, `
+name: TestGroup
+rules:
+  - alert: ExampleAlertAlwaysFiring
+    expr: sum by(job) (up == 1)
+  - record: handler:requests:rate5m
+    expr: sum(rate(prometheus_http_requests_total[5m])) by (handler)
+`, `
+name: TestGroup
+rules:
+  - record: handler:requests:rate5m
+    expr: sum(rate(prometheus_http_requests_total[5m])) by (handler)
+  - alert: ExampleAlertAlwaysFiring
+    expr: sum by(job) (up == 1)
+`)
+	})
+
+	t.Run("Ok, `for` must change cs", func(t *testing.T) {
+		f(t, `
+name: TestGroup
+rules:
+  - alert: ExampleAlertWithFor
+    expr: sum by(job) (up == 1)
+    for: 5m
+`, `
+name: TestGroup
+rules:
+  - alert: ExampleAlertWithFor
+    expr: sum by(job) (up == 1)
+`)
+	})
+
 }

@@ -60,27 +60,15 @@ func openFilePart(path string) (*part, error) {
 	}
 
 	timestampsPath := path + "/timestamps.bin"
-	timestampsFile, err := fs.OpenReaderAt(timestampsPath)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open timestamps file: %w", err)
-	}
+	timestampsFile := fs.MustOpenReaderAt(timestampsPath)
 	timestampsSize := fs.MustFileSize(timestampsPath)
 
 	valuesPath := path + "/values.bin"
-	valuesFile, err := fs.OpenReaderAt(valuesPath)
-	if err != nil {
-		timestampsFile.MustClose()
-		return nil, fmt.Errorf("cannot open values file: %w", err)
-	}
+	valuesFile := fs.MustOpenReaderAt(valuesPath)
 	valuesSize := fs.MustFileSize(valuesPath)
 
 	indexPath := path + "/index.bin"
-	indexFile, err := fs.OpenReaderAt(indexPath)
-	if err != nil {
-		timestampsFile.MustClose()
-		valuesFile.MustClose()
-		return nil, fmt.Errorf("cannot open index file: %w", err)
-	}
+	indexFile := fs.MustOpenReaderAt(indexPath)
 	indexSize := fs.MustFileSize(indexPath)
 
 	metaindexPath := path + "/metaindex.bin"
@@ -232,8 +220,8 @@ func (ibc *indexBlockCache) cleanByTimeout() {
 	currentTime := fasttime.UnixTimestamp()
 	ibc.mu.Lock()
 	for k, ibe := range ibc.m {
-		// Delete items accessed more than 10 minutes ago.
-		if currentTime-atomic.LoadUint64(&ibe.lastAccessTime) > 10*60 {
+		// Delete items accessed more than a minute ago.
+		if currentTime-atomic.LoadUint64(&ibe.lastAccessTime) > 60 {
 			delete(ibc.m, k)
 		}
 	}
@@ -261,7 +249,7 @@ func (ibc *indexBlockCache) Get(k uint64) *indexBlock {
 func (ibc *indexBlockCache) Put(k uint64, ib *indexBlock) {
 	ibc.mu.Lock()
 
-	// Clean superflouos cache entries.
+	// Clean superfluous cache entries.
 	if overflow := len(ibc.m) - getMaxCachedIndexBlocksPerPart(); overflow > 0 {
 		// Remove 10% of items from the cache.
 		overflow = int(float64(len(ibc.m)) * 0.1)

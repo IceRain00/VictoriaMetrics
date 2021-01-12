@@ -10,6 +10,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -19,14 +20,19 @@ import (
 )
 
 var (
-	retentionPeriod = flag.Int("retentionPeriod", 1, "Retention period in months")
-	snapshotAuthKey = flag.String("snapshotAuthKey", "", "authKey, which must be passed in query string to /snapshot* pages")
+	retentionPeriod   = flagutil.NewDuration("retentionPeriod", 1, "Data with timestamps outside the retentionPeriod is automatically deleted")
+	snapshotAuthKey   = flag.String("snapshotAuthKey", "", "authKey, which must be passed in query string to /snapshot* pages")
+	forceMergeAuthKey = flag.String("forceMergeAuthKey", "", "authKey, which must be passed in query string to /internal/force_merge pages")
+	forceFlushAuthKey = flag.String("forceFlushAuthKey", "", "authKey, which must be passed in query string to /internal/force_flush pages")
 
 	precisionBits = flag.Int("precisionBits", 64, "The number of precision bits to store per each value. Lower precision bits improves data compression at the cost of precision loss")
 
 	// DataPath is a path to storage data.
 	DataPath = flag.String("storageDataPath", "victoria-metrics-data", "Path to storage data")
 
+	finalMergeDelay = flag.Duration("finalMergeDelay", 0, "The delay before starting final merge for per-month partition after no new data is ingested into it. "+
+		"Final merge may require additional disk IO and CPU resources. Final merge may increase query speed and reduce disk space usage in some cases. "+
+		"Zero value disables final merge")
 	bigMergeConcurrency   = flag.Int("bigMergeConcurrency", 0, "The maximum number of CPU cores to use for big merges. Default value is used if set to 0")
 	smallMergeConcurrency = flag.Int("smallMergeConcurrency", 0, "The maximum number of CPU cores to use for small merges. Default value is used if set to 0")
 
@@ -40,39 +46,41 @@ func CheckTimeRange(tr storage.TimeRange) error {
 	if !*denyQueriesOutsideRetention {
 		return nil
 	}
-	minAllowedTimestamp := (int64(fasttime.UnixTimestamp()) - int64(*retentionPeriod)*3600*24*30) * 1000
+	minAllowedTimestamp := int64(fasttime.UnixTimestamp()*1000) - retentionPeriod.Msecs
 	if tr.MinTimestamp > minAllowedTimestamp {
 		return nil
 	}
 	return &httpserver.ErrorWithStatusCode{
-		Err:        fmt.Errorf("the given time range %s is outside the allowed retention of %d months according to -denyQueriesOutsideRetention", &tr, *retentionPeriod),
+		Err:        fmt.Errorf("the given time range %s is outside the allowed -retentionPeriod=%s according to -denyQueriesOutsideRetention", &tr, retentionPeriod),
 		StatusCode: http.StatusServiceUnavailable,
 	}
 }
 
 // Init initializes vmstorage.
-func Init() {
-	InitWithoutMetrics()
+func Init(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
+	InitWithoutMetrics(resetCacheIfNeeded)
 	registerStorageMetrics()
 }
 
 // InitWithoutMetrics must be called instead of Init inside tests.
 //
 // This allows multiple Init / Stop cycles.
-func InitWithoutMetrics() {
+func InitWithoutMetrics(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	if err := encoding.CheckPrecisionBits(uint8(*precisionBits)); err != nil {
 		logger.Fatalf("invalid `-precisionBits`: %s", err)
 	}
 
+	resetResponseCacheIfNeeded = resetCacheIfNeeded
+	storage.SetFinalMergeDelay(*finalMergeDelay)
 	storage.SetBigMergeWorkersCount(*bigMergeConcurrency)
 	storage.SetSmallMergeWorkersCount(*smallMergeConcurrency)
 
-	logger.Infof("opening storage at %q with retention period %d months", *DataPath, *retentionPeriod)
+	logger.Infof("opening storage at %q with -retentionPeriod=%s", *DataPath, retentionPeriod)
 	startTime := time.Now()
 	WG = syncwg.WaitGroup{}
-	strg, err := storage.OpenStorage(*DataPath, *retentionPeriod)
+	strg, err := storage.OpenStorage(*DataPath, retentionPeriod.Msecs)
 	if err != nil {
-		logger.Fatalf("cannot open a storage at %s with retention period %d months: %s", *DataPath, *retentionPeriod, err)
+		logger.Fatalf("cannot open a storage at %s with -retentionPeriod=%s: %s", *DataPath, retentionPeriod, err)
 	}
 	Storage = strg
 
@@ -98,10 +106,22 @@ var Storage *storage.Storage
 // Use syncwg instead of sync, since Add is called from concurrent goroutines.
 var WG syncwg.WaitGroup
 
+// resetResponseCacheIfNeeded is a callback for automatic resetting of response cache if needed.
+var resetResponseCacheIfNeeded func(mrs []storage.MetricRow)
+
 // AddRows adds mrs to the storage.
 func AddRows(mrs []storage.MetricRow) error {
+	resetResponseCacheIfNeeded(mrs)
 	WG.Add(1)
 	err := Storage.AddRows(mrs, uint8(*precisionBits))
+	WG.Done()
+	return err
+}
+
+// RegisterMetricNames registers all the metrics from mrs in the storage.
+func RegisterMetricNames(mrs []storage.MetricRow) error {
+	WG.Add(1)
+	err := Storage.RegisterMetricNames(mrs)
 	WG.Done()
 	return err
 }
@@ -116,42 +136,76 @@ func DeleteMetrics(tfss []*storage.TagFilters) (int, error) {
 	return n, err
 }
 
-// SearchTagKeys searches for tag keys
-func SearchTagKeys(maxTagKeys int) ([]string, error) {
+// SearchMetricNames returns metric names for the given tfss on the given tr.
+func SearchMetricNames(tfss []*storage.TagFilters, tr storage.TimeRange, maxMetrics int, deadline uint64) ([]storage.MetricName, error) {
 	WG.Add(1)
-	keys, err := Storage.SearchTagKeys(maxTagKeys)
+	mns, err := Storage.SearchMetricNames(tfss, tr, maxMetrics, deadline)
+	WG.Done()
+	return mns, err
+}
+
+// SearchTagKeysOnTimeRange searches for tag keys on tr.
+func SearchTagKeysOnTimeRange(tr storage.TimeRange, maxTagKeys int, deadline uint64) ([]string, error) {
+	WG.Add(1)
+	keys, err := Storage.SearchTagKeysOnTimeRange(tr, maxTagKeys, deadline)
 	WG.Done()
 	return keys, err
 }
 
-// SearchTagValues searches for tag values for the given tagKey
-func SearchTagValues(tagKey []byte, maxTagValues int) ([]string, error) {
+// SearchTagKeys searches for tag keys
+func SearchTagKeys(maxTagKeys int, deadline uint64) ([]string, error) {
 	WG.Add(1)
-	values, err := Storage.SearchTagValues(tagKey, maxTagValues)
+	keys, err := Storage.SearchTagKeys(maxTagKeys, deadline)
+	WG.Done()
+	return keys, err
+}
+
+// SearchTagValuesOnTimeRange searches for tag values for the given tagKey on tr.
+func SearchTagValuesOnTimeRange(tagKey []byte, tr storage.TimeRange, maxTagValues int, deadline uint64) ([]string, error) {
+	WG.Add(1)
+	values, err := Storage.SearchTagValuesOnTimeRange(tagKey, tr, maxTagValues, deadline)
 	WG.Done()
 	return values, err
 }
 
-// SearchTagEntries searches for tag entries.
-func SearchTagEntries(maxTagKeys, maxTagValues int) ([]storage.TagEntry, error) {
+// SearchTagValues searches for tag values for the given tagKey
+func SearchTagValues(tagKey []byte, maxTagValues int, deadline uint64) ([]string, error) {
 	WG.Add(1)
-	tagEntries, err := Storage.SearchTagEntries(maxTagKeys, maxTagValues)
+	values, err := Storage.SearchTagValues(tagKey, maxTagValues, deadline)
+	WG.Done()
+	return values, err
+}
+
+// SearchTagValueSuffixes returns all the tag value suffixes for the given tagKey and tagValuePrefix on the given tr.
+//
+// This allows implementing https://graphite-api.readthedocs.io/en/latest/api.html#metrics-find or similar APIs.
+func SearchTagValueSuffixes(tr storage.TimeRange, tagKey, tagValuePrefix []byte, delimiter byte, maxTagValueSuffixes int, deadline uint64) ([]string, error) {
+	WG.Add(1)
+	suffixes, err := Storage.SearchTagValueSuffixes(tr, tagKey, tagValuePrefix, delimiter, maxTagValueSuffixes, deadline)
+	WG.Done()
+	return suffixes, err
+}
+
+// SearchTagEntries searches for tag entries.
+func SearchTagEntries(maxTagKeys, maxTagValues int, deadline uint64) ([]storage.TagEntry, error) {
+	WG.Add(1)
+	tagEntries, err := Storage.SearchTagEntries(maxTagKeys, maxTagValues, deadline)
 	WG.Done()
 	return tagEntries, err
 }
 
 // GetTSDBStatusForDate returns TSDB status for the given date.
-func GetTSDBStatusForDate(date uint64, topN int) (*storage.TSDBStatus, error) {
+func GetTSDBStatusForDate(date uint64, topN int, deadline uint64) (*storage.TSDBStatus, error) {
 	WG.Add(1)
-	status, err := Storage.GetTSDBStatusForDate(date, topN)
+	status, err := Storage.GetTSDBStatusForDate(date, topN, deadline)
 	WG.Done()
 	return status, err
 }
 
 // GetSeriesCount returns the number of time series in the storage.
-func GetSeriesCount() (uint64, error) {
+func GetSeriesCount(deadline uint64) (uint64, error) {
 	WG.Add(1)
-	n, err := Storage.GetSeriesCount()
+	n, err := Storage.GetSeriesCount(deadline)
 	WG.Done()
 	return n, err
 }
@@ -170,6 +224,36 @@ func Stop() {
 // RequestHandler is a storage request handler.
 func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	path := r.URL.Path
+	if path == "/internal/force_merge" {
+		authKey := r.FormValue("authKey")
+		if authKey != *forceMergeAuthKey {
+			httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -forceMergeAuthKey command line flag", authKey)
+			return true
+		}
+		// Run force merge in background
+		partitionNamePrefix := r.FormValue("partition_prefix")
+		go func() {
+			activeForceMerges.Inc()
+			defer activeForceMerges.Dec()
+			logger.Infof("forced merge for partition_prefix=%q has been started", partitionNamePrefix)
+			startTime := time.Now()
+			if err := Storage.ForceMergePartitions(partitionNamePrefix); err != nil {
+				logger.Errorf("error in forced merge for partition_prefix=%q: %s", partitionNamePrefix, err)
+			}
+			logger.Infof("forced merge for partition_prefix=%q has been successfully finished in %.3f seconds", partitionNamePrefix, time.Since(startTime).Seconds())
+		}()
+		return true
+	}
+	if path == "/internal/force_flush" {
+		authKey := r.FormValue("authKey")
+		if authKey != *forceFlushAuthKey {
+			httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -forceFlushAuthKey command line flag", authKey)
+			return true
+		}
+		logger.Infof("flushing storage to make pending data available for reading")
+		Storage.DebugFlush()
+		return true
+	}
 	prometheusCompatibleResponse := false
 	if path == "/api/v1/admin/tsdb/snapshot" {
 		// Handle Prometheus API - https://prometheus.io/docs/prometheus/latest/querying/api/#snapshot .
@@ -181,14 +265,14 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	}
 	authKey := r.FormValue("authKey")
 	if authKey != *snapshotAuthKey {
-		httpserver.Errorf(w, "invalid authKey %q. It must match the value from -snapshotAuthKey command line flag", authKey)
+		httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -snapshotAuthKey command line flag", authKey)
 		return true
 	}
 	path = path[len("/snapshot"):]
 
 	switch path {
 	case "/create":
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snapshotPath, err := Storage.CreateSnapshot()
 		if err != nil {
 			err = fmt.Errorf("cannot create snapshot: %w", err)
@@ -202,7 +286,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	case "/list":
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snapshots, err := Storage.ListSnapshots()
 		if err != nil {
 			err = fmt.Errorf("cannot list snapshots: %w", err)
@@ -219,7 +303,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		fmt.Fprintf(w, `]}`)
 		return true
 	case "/delete":
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snapshotName := r.FormValue("snapshot")
 		if err := Storage.DeleteSnapshot(snapshotName); err != nil {
 			err = fmt.Errorf("cannot delete snapshot %q: %w", snapshotName, err)
@@ -229,7 +313,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		fmt.Fprintf(w, `{"status":"ok"}`)
 		return true
 	case "/delete_all":
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snapshots, err := Storage.ListSnapshots()
 		if err != nil {
 			err = fmt.Errorf("cannot list snapshots: %w", err)
@@ -249,6 +333,8 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 }
+
+var activeForceMerges = metrics.NewCounter("vm_active_force_merges")
 
 func registerStorageMetrics() {
 	mCache := &storage.Metrics{}
@@ -339,12 +425,6 @@ func registerStorageMetrics() {
 	metrics.NewGauge(`vm_missing_tsids_for_metric_id_total`, func() float64 {
 		return float64(idbm().MissingTSIDsForMetricID)
 	})
-	metrics.NewGauge(`vm_recent_hour_metric_ids_search_calls_total`, func() float64 {
-		return float64(idbm().RecentHourMetricIDsSearchCalls)
-	})
-	metrics.NewGauge(`vm_recent_hour_metric_ids_search_hits_total`, func() float64 {
-		return float64(idbm().RecentHourMetricIDsSearchHits)
-	})
 	metrics.NewGauge(`vm_date_metric_ids_search_calls_total`, func() float64 {
 		return float64(idbm().DateMetricIDsSearchCalls)
 	})
@@ -363,6 +443,14 @@ func registerStorageMetrics() {
 	})
 	metrics.NewGauge(`vm_assisted_merges_total{type="indexdb"}`, func() float64 {
 		return float64(idbm().AssistedMerges)
+	})
+
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/686
+	metrics.NewGauge(`vm_merge_need_free_disk_space{type="storage/small"}`, func() float64 {
+		return float64(tm().SmallMergeNeedFreeDiskSpace)
+	})
+	metrics.NewGauge(`vm_merge_need_free_disk_space{type="storage/big"}`, func() float64 {
+		return float64(tm().BigMergeNeedFreeDiskSpace)
 	})
 
 	metrics.NewGauge(`vm_pending_rows{type="storage"}`, func() float64 {
@@ -402,6 +490,9 @@ func registerStorageMetrics() {
 		return float64(idbm().SizeBytes)
 	})
 
+	metrics.NewGauge(`vm_rows_added_to_storage_total`, func() float64 {
+		return float64(m().RowsAddedTotal)
+	})
 	metrics.NewGauge(`vm_deduplicated_samples_total{type="merge"}`, func() float64 {
 		return float64(m().DedupsDuringMerge)
 	})
@@ -429,6 +520,19 @@ func registerStorageMetrics() {
 		return float64(m().AddRowsConcurrencyCurrent)
 	})
 
+	metrics.NewGauge(`vm_concurrent_search_tsids_limit_reached_total`, func() float64 {
+		return float64(m().SearchTSIDsConcurrencyLimitReached)
+	})
+	metrics.NewGauge(`vm_concurrent_search_tsids_limit_timeout_total`, func() float64 {
+		return float64(m().SearchTSIDsConcurrencyLimitTimeout)
+	})
+	metrics.NewGauge(`vm_concurrent_search_tsids_capacity`, func() float64 {
+		return float64(m().SearchTSIDsConcurrencyCapacity)
+	})
+	metrics.NewGauge(`vm_concurrent_search_tsids_current`, func() float64 {
+		return float64(m().SearchTSIDsConcurrencyCurrent)
+	})
+
 	metrics.NewGauge(`vm_search_delays_total`, func() float64 {
 		return float64(m().SearchDelays)
 	})
@@ -441,6 +545,13 @@ func registerStorageMetrics() {
 	})
 	metrics.NewGauge(`vm_slow_metric_name_loads_total`, func() float64 {
 		return float64(m().SlowMetricNameLoads)
+	})
+
+	metrics.NewGauge(`vm_timestamps_blocks_merged_total`, func() float64 {
+		return float64(m().TimestampsBlocksMerged)
+	})
+	metrics.NewGauge(`vm_timestamps_bytes_saved_total`, func() float64 {
+		return float64(m().TimestampsBytesSaved)
 	})
 
 	metrics.NewGauge(`vm_rows{type="storage/big"}`, func() float64 {
@@ -510,7 +621,7 @@ func registerStorageMetrics() {
 	metrics.NewGauge(`vm_cache_entries{type="storage/regexps"}`, func() float64 {
 		return float64(storage.RegexpCacheSize())
 	})
-	metrics.NewGauge(`vm_cache_size_entries{type="storage/prefetchedMetricIDs"}`, func() float64 {
+	metrics.NewGauge(`vm_cache_entries{type="storage/prefetchedMetricIDs"}`, func() float64 {
 		return float64(m().PrefetchedMetricIDsSize)
 	})
 

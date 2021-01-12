@@ -186,12 +186,16 @@ func mustSyncParentDirIfExists(path string) {
 
 // MustRemoveAll removes path with all the contents.
 //
+// It properly fsyncs the parent directory after path removal.
+//
 // It properly handles NFS issue https://github.com/VictoriaMetrics/VictoriaMetrics/issues/61 .
 func MustRemoveAll(path string) {
 	_ = mustRemoveAll(path, func() {})
 }
 
 // MustRemoveAllWithDoneCallback removes path with all the contents.
+//
+// It properly fsyncs the parent directory after path removal.
 //
 // done is called after the path is successfully removed.
 //
@@ -338,6 +342,5 @@ func mustGetFreeSpace(path string) uint64 {
 	if err := unix.Fstatfs(int(fd), &stat); err != nil {
 		logger.Panicf("FATAL: cannot determine free disk space on %q: %s", path, err)
 	}
-	freeSpace := uint64(stat.Bavail) * uint64(stat.Bsize)
-	return freeSpace
+	return freeSpace(stat)
 }

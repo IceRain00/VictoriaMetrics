@@ -2,13 +2,33 @@ Release process guidance
 
 ## Release version and Docker images
 
-1. Create release tag with `git tag v1.xx.y`.
+0. Document all the changes for new release in [CHANGELOG.md](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/docs/CHANGELOG.md).
+1. Create release tag with `git tag v1.xx.y` in `master` branch and `git tag v1.xx.y-cluster` in `cluster` branch.
 2. Run `make release` for creating `*.tar.gz` release archive with the corresponding `_checksums.txt` inside `bin` directory.
 3. Run `make publish` for creating and publishing Docker images.
-4. Push release tag to https://github.com/VictoriaMetrics/VictoriaMetrics : `git push origin v1.xx.y`.
-5. Go to https://github.com/VictoriaMetrics/VictoriaMetrics/releases , create new release from the pushed tag on step 4
-   and upload `*.tar.gz` archive with the corresponding `_checksums.txt` from step 2.
+4. Repeat steps 3-4 for `cluster` branch.
+5. Push release tag to https://github.com/VictoriaMetrics/VictoriaMetrics : `git push origin v1.xx.y`.
+6. Go to https://github.com/VictoriaMetrics/VictoriaMetrics/releases , create new release from the pushed tag on step 5 and upload `*.tar.gz` archive with the corresponding `_checksums.txt` from step 2.
 
+## Building snap package.
+
+ pre-requirements: 
+- snapcraft binary, can be installed with commands:
+   for MacOS `brew install snapcraft` and [install mutipass](https://discourse.ubuntu.com/t/installing-multipass-on-macos/8329),
+   for Ubuntu - `sudo snap install snapcraft --classic`
+- login with `snapcraft login`
+- already created release at github (it operates `git describe` version, so git tag must be annotated).
+
+0. checkout to the latest git tag for single-node version.
+1. execute `make release-snap` - it must build and upload snap package.
+2. promote release to current, if needed manually at release page [snapcraft-releases](https://snapcraft.io/victoriametrics/releases)
+
+### Public Announcement 
+
+1. Publish message in slack (victoriametrics.slack.com, general channel)
+2. Post twit with release notes URL
+3. Post in subreddit https://www.reddit.com/r/VictoriaMetrics/ 
+4. Post in linkedin
 
 ## Helm Charts
 

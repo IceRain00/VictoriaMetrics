@@ -206,8 +206,9 @@ func applyRelabelConfig(labels []prompbmarshal.Label, labelsOffset int, prc *Par
 			}
 			value := relabelBufPool.Get()
 			value.B = prc.Regex.ExpandString(value.B[:0], prc.Replacement, label.Name, match)
-			label.Name = string(value.B)
+			labelName := string(value.B)
 			relabelBufPool.Put(value)
+			labels = setLabelValue(labels, labelsOffset, labelName, label.Value)
 		}
 		return labels
 	case "labelmap_all":
@@ -334,4 +335,15 @@ func GetLabelValueByName(labels []prompbmarshal.Label, name string) string {
 		return ""
 	}
 	return label.Value
+}
+
+// CleanLabels sets label.Name and label.Value to an empty string for all the labels.
+//
+// This should help GC cleaning up label.Name and label.Value strings.
+func CleanLabels(labels []prompbmarshal.Label) {
+	for i := range labels {
+		label := &labels[i]
+		label.Name = ""
+		label.Value = ""
+	}
 }

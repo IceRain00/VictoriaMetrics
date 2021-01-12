@@ -3,10 +3,42 @@
 Below are approved public case studies and talks from VictoriaMetrics users. Join our [community Slack channel](http://slack.victoriametrics.com/)
 and feel free asking for references, reviews and additional case studies from real VictoriaMetrics users there.
 
-See also [articles about VictoriaMetrics](https://github.com/VictoriaMetrics/VictoriaMetrics/wiki/Articles).
+See also [articles about VictoriaMetrics from our users](https://victoriametrics.github.io/Articles.html#third-party-articles-and-slides).
+
+Alphabetically sorted links to case studies:
+
+* [adidas](#adidas)
+* [Adsterra](#adsterra)
+* [ARNES](#arnes)
+* [Brandwatch](#brandwatch)
+* [CERN](#cern)
+* [COLOPL](#colopl)
+* [Dreamteam](#dreamteam)
+* [Idealo.de](#idealode)
+* [MHI Vestas Offshore Wind](#mhi-vestas-offshore-wind)
+* [Synthesio](#synthesio)
+* [Wedos.com](#wedoscom)
+* [Wix.com](#wixcom)
+* [Zerodha](#zerodha)
+* [zhihu](#zhihu)
 
 
-## Adidas
+## zhihu
+
+[zhihu](https://www.zhihu.com) is the largest chinese question-and-answer website. We use VictoriaMetrics to store and use Graphite metrics, and we shared the [promate](https://github.com/zhihu/promate) solution in our [单机 20 亿指标，知乎 Graphite 极致优化！](https://qcon.infoq.cn/2020/shenzhen/presentation/2881)([slides](https://static001.geekbang.org/con/76/pdf/828698018/file/%E5%8D%95%E6%9C%BA%2020%20%E4%BA%BF%E6%8C%87%E6%A0%87%EF%BC%8C%E7%9F%A5%E4%B9%8E%20Graphite%20%E6%9E%81%E8%87%B4%E4%BC%98%E5%8C%96%EF%BC%81-%E7%86%8A%E8%B1%B9.pdf)) talk at [QCon 2020](https://qcon.infoq.cn/2020/shenzhen/).
+
+Numbers:
+
+- Active time series: ~2500 Million
+- Datapoints: ~20 Trillion
+- Ingestion rate: ~1800k/s
+- Disk usage: ~20 TiB
+- Index size: ~600 GiB
+- The average query rate is ~3k per second (mostly alert queries).
+- Query duration: median is ~40ms, 99th percentile is ~100ms.
+
+
+## adidas
 
 See [slides](https://promcon.io/2019-munich/slides/remote-write-storage-wars.pdf) and [video](https://youtu.be/OsH6gPdxR4s)
 from [Remote Write Storage Wars](https://promcon.io/2019-munich/talks/remote-write-storage-wars/) talk at [PromCon 2019](https://promcon.io/2019-munich/).
@@ -57,7 +89,7 @@ Thanos, Cortex and VictoriaMetrics were evaluated as a long-term storage for Pro
 * Blazing fast benchmarks for a single node setup.
 * Single binary mode. Easy to scale vertically, very less operational headache.
 * Considerable [improvements on creating Histograms](https://medium.com/@valyala/improving-histogram-usability-for-prometheus-and-grafana-bc7e5df0e350).
-* [MetricsQL](https://github.com/VictoriaMetrics/VictoriaMetrics/wiki/MetricsQL) gives us the ability to extend PromQL with more aggregation operators.
+* [MetricsQL](https://victoriametrics.github.io/MetricsQL.html) gives us the ability to extend PromQL with more aggregation operators.
 * API is compatible with Prometheus, almost all standard PromQL queries just work out of the box.
 * Handles storage well, with periodic compaction. Makes it easy to take snapshots.
 
@@ -69,17 +101,18 @@ See [Monitoring K8S with VictoriaMetrics](https://docs.google.com/presentation/d
 
 [Wix.com](https://en.wikipedia.org/wiki/Wix.com) is the leading web development platform.
 
-> We needed to redesign metric infrastructure from the ground up after the move to Kubernethes. A few approaches/designs have been tried before the one that works great has been chosen: Prometheus instance in every datacenter with 2 hours retention for local storage and remote write into [HA pair of single-node VictoriaMetrics instances](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#high-availability).
+> We needed to redesign metric infrastructure from the ground up after the move to Kubernethes. A few approaches/designs have been tried before the one that works great has been chosen: Prometheus instance in every datacenter with 2 hours retention for local storage and remote write into [HA pair of single-node VictoriaMetrics instances](https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#high-availability).
 
 Numbers:
 
-* The number of active time series per VictoriaMetrics instance is 20M.
-* The total number of time series per VictoriaMetrics instance is 400M+.
-* Ingestion rate per VictoriaMetrics instance is 800K data points per second.
-* The average time series churn rate is ~3M per day.
-* The average query rate is ~1K per minute (mostly alert queries).
-* Query duration: median is ~70ms, 99th percentile is ~2sec.
-* Retention: 6 months.
+* The number of active time series per VictoriaMetrics instance is 40M.
+* The total number of time series per VictoriaMetrics instance is 5000M+.
+* Ingestion rate per VictoriaMetrics instance is 1M data points per second.
+* The total number of datapoints per VictoriaMetrics instance is 8.5 trillions.
+* The average time series churn rate is ~80M per day.
+* The average query rate is ~100 per second (mostly alert queries).
+* Query duration: median is ~20ms, 99th percentile is ~1.5sec.
+* Retention: 3 months.
 
 > Alternatives that we’ve played with before choosing VictoriaMetrics are: federated Prometheus, Cortex, IronDB and Thanos.
 > Points that were critical to us when we were choosing a central tsdb, in order of importance:
@@ -91,14 +124,14 @@ Numbers:
 * Enough head room/scaling capacity for future growth, up to 100M active time series.
 * Ability to split DB replicas per workload. Alert queries go to one replica, user queries go to another (speed for users, effective cache).
 
-> Optimizing for those points and our specific workload VictoriaMetrics proved to be the best option. As an icing on a cake we’ve got [PromQL extensions](https://github.com/VictoriaMetrics/VictoriaMetrics/wiki/MetricsQL) - `default 0` and `histogram` are my favorite ones, for example. What we specially like is having a lot of tsdb params easily available via config options, that makes tsdb easy to tune for specific use case. Also worth noting is a great community in [Slack channel](http://slack.victoriametrics.com/) and of course maintainer support.
+> Optimizing for those points and our specific workload VictoriaMetrics proved to be the best option. As an icing on a cake we’ve got [PromQL extensions](https://victoriametrics.github.io/MetricsQL.html) - `default 0` and `histogram` are my favorite ones, for example. What we specially like is having a lot of tsdb params easily available via config options, that makes tsdb easy to tune for specific use case. Also worth noting is a great community in [Slack channel](http://slack.victoriametrics.com/) and of course maintainer support.
 
 Alex Ulstein, Head of Monitoring, Wix.com
 
 
 ## Wedos.com
 
-> [Wedos](https://www.wedos.com/) is the Biggest Czech Hosting. We have our own private data center, that holds only our servers and technologies. The second data center, where the servers will be cooled in an oil bath, is being built. We started using [cluster VictoriaMetrics](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/cluster/README.md) to store Prometheus metrics from all our infrastructure after receiving positive references from our friends who successfully use VictoriaMetrics.
+> [Wedos](https://www.wedos.com/) is the Biggest Czech Hosting. We have our own private data center, that holds only our servers and technologies. The second data center, where the servers will be cooled in an oil bath, is being built. We started using [cluster VictoriaMetrics](https://victoriametrics.github.io/Cluster-VictoriaMetrics.html) to store Prometheus metrics from all our infrastructure after receiving positive references from our friends who successfully use VictoriaMetrics.
 
 Numbers:
 
@@ -219,12 +252,12 @@ We end up with the following configuration:
 
 Turns out that remote write protocol generates too much traffic and connections. So after 8 months we started to look for alternatives.
 
-Around the same time VictoriaMetrics released [vmagent](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/app/vmagent/README.md).
+Around the same time VictoriaMetrics released [vmagent](https://victoriametrics.github.io/vmagent.html).
 We tried to scrape all the metrics via a single insance of vmagent. But that didn't work - vmgent wasn't able to catch up with writes
 into VictoriaMetrics. We tested different options and end up with the following scheme:
 
 - We removed Prometheus from our setup.
-- VictoriaMetrics [can scrape targets](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-scrape-prometheus-exporters-such-as-node-exporter) as well,
+- VictoriaMetrics [can scrape targets](https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#how-to-scrape-prometheus-exporters-such-as-node-exporter) as well,
 so we removed vmagent. Now VictoriaMetrics scrapes all the metrics from 110 jobs and 5531 targets.
 - We use [Promxy](https://github.com/jacksontj/promxy) for alerting.
 
@@ -235,7 +268,7 @@ Such a scheme has the following benefits comparing to Prometheus:
 
 Cons are the following:
 
-- VictoriaMetrics didn't support replication (it [supports replication now](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/cluster/README.md#replication-and-data-safety)) - we run extra instance of VictoriaMetrics and Promxy in front of VictoriaMetrics pair for high availability.
+- VictoriaMetrics didn't support replication (it [supports replication now](https://victoriametrics.github.io/Cluster-VictoriaMetrics.html#replication-and-data-safety)) - we run extra instance of VictoriaMetrics and Promxy in front of VictoriaMetrics pair for high availability.
 - VictoriaMetrics stores 1 extra month for defined retention (if retention is set to N months, then VM stores N+1 months of data), but this is still better than other solutions.
 
 Some numbers from our single-node VictoriaMetrics setup:
@@ -303,3 +336,21 @@ Grafana has a LB infront, so if one DC has problems, we can still view all metri
 
 We are still in the process of migration, but we are really happy with the whole stack. It has proven as an essential piece
 for insight into our services during COVID-19 and has enabled us to provide better service and spot problems faster.
+
+
+## Idealo.de
+
+[idealo.de](https://www.idealo.de/) is the leading price comparison website in Germany. We use Prometheus for metrics on our container platform.
+When we introduced Prometheus at idealo we started with m3db as a longterm storage. In our setup m3db was quite unstable and consumed a lot of resources.
+
+VictoriaMetrics runs very stable for us and uses only a fraction of the resources. Although we also increased our retention time from 1 month to 13 months.
+
+Numbers:
+
+- The number of active time series per VictoriaMetrics instance is 21M.
+- Total ingestion rate 120k metrics per second.
+- The total number of datapoints 3.1 trillion.
+- The average time series churn rate is ~9M per day.
+- The average query rate is ~20 per second. Response time for 99th quantile is 120ms.
+- Retention: 13 months.
+- Size of all datapoints: 3.5 TB

@@ -41,7 +41,6 @@ func (ctx *InsertCtx) Reset(rowsLen int) {
 	}
 	ctx.mrs = ctx.mrs[:0]
 	ctx.metricNamesBuf = ctx.metricNamesBuf[:0]
-
 	ctx.relabelCtx.Reset()
 }
 
@@ -54,23 +53,23 @@ func (ctx *InsertCtx) marshalMetricNameRaw(prefix []byte, labels []prompb.Label)
 }
 
 // WriteDataPoint writes (timestamp, value) with the given prefix and labels into ctx buffer.
-func (ctx *InsertCtx) WriteDataPoint(prefix []byte, labels []prompb.Label, timestamp int64, value float64) {
+func (ctx *InsertCtx) WriteDataPoint(prefix []byte, labels []prompb.Label, timestamp int64, value float64) error {
 	metricNameRaw := ctx.marshalMetricNameRaw(prefix, labels)
-	ctx.addRow(metricNameRaw, timestamp, value)
+	return ctx.addRow(metricNameRaw, timestamp, value)
 }
 
 // WriteDataPointExt writes (timestamp, value) with the given metricNameRaw and labels into ctx buffer.
 //
 // It returns metricNameRaw for the given labels if len(metricNameRaw) == 0.
-func (ctx *InsertCtx) WriteDataPointExt(metricNameRaw []byte, labels []prompb.Label, timestamp int64, value float64) []byte {
+func (ctx *InsertCtx) WriteDataPointExt(metricNameRaw []byte, labels []prompb.Label, timestamp int64, value float64) ([]byte, error) {
 	if len(metricNameRaw) == 0 {
 		metricNameRaw = ctx.marshalMetricNameRaw(nil, labels)
 	}
-	ctx.addRow(metricNameRaw, timestamp, value)
-	return metricNameRaw
+	err := ctx.addRow(metricNameRaw, timestamp, value)
+	return metricNameRaw, err
 }
 
-func (ctx *InsertCtx) addRow(metricNameRaw []byte, timestamp int64, value float64) {
+func (ctx *InsertCtx) addRow(metricNameRaw []byte, timestamp int64, value float64) error {
 	mrs := ctx.mrs
 	if cap(mrs) > len(mrs) {
 		mrs = mrs[:len(mrs)+1]
@@ -82,46 +81,48 @@ func (ctx *InsertCtx) addRow(metricNameRaw []byte, timestamp int64, value float6
 	mr.MetricNameRaw = metricNameRaw
 	mr.Timestamp = timestamp
 	mr.Value = value
+	if len(ctx.metricNamesBuf) > 16*1024*1024 {
+		if err := ctx.FlushBufs(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // AddLabelBytes adds (name, value) label to ctx.Labels.
 //
 // name and value must exist until ctx.Labels is used.
 func (ctx *InsertCtx) AddLabelBytes(name, value []byte) {
-	labels := ctx.Labels
-	if cap(labels) > len(labels) {
-		labels = labels[:len(labels)+1]
-	} else {
-		labels = append(labels, prompb.Label{})
+	if len(value) == 0 {
+		// Skip labels without values, since they have no sense.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/600
+		// Do not skip labels with empty name, since they are equal to __name__.
+		return
 	}
-	label := &labels[len(labels)-1]
-
-	// Do not copy name and value contents for performance reasons.
-	// This reduces GC overhead on the number of objects and allocations.
-	label.Name = name
-	label.Value = value
-
-	ctx.Labels = labels
+	ctx.Labels = append(ctx.Labels, prompb.Label{
+		// Do not copy name and value contents for performance reasons.
+		// This reduces GC overhead on the number of objects and allocations.
+		Name:  name,
+		Value: value,
+	})
 }
 
 // AddLabel adds (name, value) label to ctx.Labels.
 //
 // name and value must exist until ctx.Labels is used.
 func (ctx *InsertCtx) AddLabel(name, value string) {
-	labels := ctx.Labels
-	if cap(labels) > len(labels) {
-		labels = labels[:len(labels)+1]
-	} else {
-		labels = append(labels, prompb.Label{})
+	if len(value) == 0 {
+		// Skip labels without values, since they have no sense.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/600
+		// Do not skip labels with empty name, since they are equal to __name__.
+		return
 	}
-	label := &labels[len(labels)-1]
-
-	// Do not copy name and value contents for performance reasons.
-	// This reduces GC overhead on the number of objects and allocations.
-	label.Name = bytesutil.ToUnsafeBytes(name)
-	label.Value = bytesutil.ToUnsafeBytes(value)
-
-	ctx.Labels = labels
+	ctx.Labels = append(ctx.Labels, prompb.Label{
+		// Do not copy name and value contents for performance reasons.
+		// This reduces GC overhead on the number of objects and allocations.
+		Name:  bytesutil.ToUnsafeBytes(name),
+		Value: bytesutil.ToUnsafeBytes(value),
+	})
 }
 
 // ApplyRelabeling applies relabeling to ic.Labels.
@@ -131,11 +132,13 @@ func (ctx *InsertCtx) ApplyRelabeling() {
 
 // FlushBufs flushes buffered rows to the underlying storage.
 func (ctx *InsertCtx) FlushBufs() error {
-	if err := vmstorage.AddRows(ctx.mrs); err != nil {
-		return &httpserver.ErrorWithStatusCode{
-			Err:        fmt.Errorf("cannot store metrics: %w", err),
-			StatusCode: http.StatusServiceUnavailable,
-		}
+	err := vmstorage.AddRows(ctx.mrs)
+	ctx.Reset(0)
+	if err == nil {
+		return nil
 	}
-	return nil
+	return &httpserver.ErrorWithStatusCode{
+		Err:        fmt.Errorf("cannot store metrics: %w", err),
+		StatusCode: http.StatusServiceUnavailable,
+	}
 }

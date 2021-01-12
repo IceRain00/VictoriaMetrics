@@ -2,10 +2,14 @@ package vmimport
 
 import (
 	"net/http"
-	"runtime"
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/common"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	parserCommon "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/vmimport"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
@@ -21,12 +25,18 @@ var (
 //
 // See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/6
 func InsertHandler(req *http.Request) error {
+	extraLabels, err := parserCommon.GetExtraLabels(req)
+	if err != nil {
+		return err
+	}
 	return writeconcurrencylimiter.Do(func() error {
-		return parser.ParseStream(req, insertRows)
+		return parser.ParseStream(req, func(rows []parser.Row) error {
+			return insertRows(rows, extraLabels)
+		})
 	})
 }
 
-func insertRows(rows []parser.Row) error {
+func insertRows(rows []parser.Row, extraLabels []prompbmarshal.Label) error {
 	ctx := getPushCtx()
 	defer putPushCtx(ctx)
 
@@ -37,14 +47,22 @@ func insertRows(rows []parser.Row) error {
 	ic := &ctx.Common
 	ic.Reset(rowsLen)
 	rowsTotal := 0
+	hasRelabeling := relabel.HasRelabeling()
 	for i := range rows {
 		r := &rows[i]
+		rowsTotal += len(r.Values)
 		ic.Labels = ic.Labels[:0]
 		for j := range r.Tags {
 			tag := &r.Tags[j]
 			ic.AddLabelBytes(tag.Key, tag.Value)
 		}
-		ic.ApplyRelabeling()
+		for j := range extraLabels {
+			label := &extraLabels[j]
+			ic.AddLabel(label.Name, label.Value)
+		}
+		if hasRelabeling {
+			ic.ApplyRelabeling()
+		}
 		if len(ic.Labels) == 0 {
 			// Skip metric without labels.
 			continue
@@ -52,12 +70,15 @@ func insertRows(rows []parser.Row) error {
 		ctx.metricNameBuf = storage.MarshalMetricNameRaw(ctx.metricNameBuf[:0], ic.Labels)
 		values := r.Values
 		timestamps := r.Timestamps
-		_ = timestamps[len(values)-1]
+		if len(timestamps) != len(values) {
+			logger.Panicf("BUG: len(timestamps)=%d must match len(values)=%d", len(timestamps), len(values))
+		}
 		for j, value := range values {
 			timestamp := timestamps[j]
-			ic.WriteDataPoint(ctx.metricNameBuf, nil, timestamp, value)
+			if err := ic.WriteDataPoint(ctx.metricNameBuf, nil, timestamp, value); err != nil {
+				return err
+			}
 		}
-		rowsTotal += len(values)
 	}
 	rowsInserted.Add(rowsTotal)
 	rowsPerInsert.Update(float64(rowsTotal))
@@ -96,4 +117,4 @@ func putPushCtx(ctx *pushCtx) {
 }
 
 var pushCtxPool sync.Pool
-var pushCtxPoolCh = make(chan *pushCtx, runtime.GOMAXPROCS(-1))
+var pushCtxPoolCh = make(chan *pushCtx, cgroup.AvailableCPUs())

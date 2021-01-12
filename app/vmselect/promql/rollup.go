@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"math"
-	"sort"
 	"strings"
 	"sync"
 
@@ -16,7 +15,7 @@ import (
 	"github.com/valyala/histogram"
 )
 
-var minStalenessInterval = flag.Duration("search.minStalenessInterval", 0, "The mimimum interval for staleness calculations. "+
+var minStalenessInterval = flag.Duration("search.minStalenessInterval", 0, "The minimum interval for staleness calculations. "+
 	"This flag could be useful for removing gaps on graphs generated from time series with irregular intervals between samples. "+
 	"See also '-search.maxStalenessInterval'")
 
@@ -29,8 +28,8 @@ var rollupFuncs = map[string]newRollupFunc{
 	"deriv_fast":         newRollupFuncOneArg(rollupDerivFast),
 	"holt_winters":       newRollupHoltWinters,
 	"idelta":             newRollupFuncOneArg(rollupIdelta),
-	"increase":           newRollupFuncOneArg(rollupIncrease), // + rollupFuncsRemoveCounterResets
-	"irate":              newRollupFuncOneArg(rollupIderiv),   // + rollupFuncsRemoveCounterResets
+	"increase":           newRollupFuncOneArg(rollupDelta),  // + rollupFuncsRemoveCounterResets
+	"irate":              newRollupFuncOneArg(rollupIderiv), // + rollupFuncsRemoveCounterResets
 	"predict_linear":     newRollupPredictLinear,
 	"rate":               newRollupFuncOneArg(rollupDerivFast), // + rollupFuncsRemoveCounterResets
 	"resets":             newRollupFuncOneArg(rollupResets),
@@ -61,8 +60,14 @@ var rollupFuncs = map[string]newRollupFunc{
 	"scrape_interval":       newRollupFuncOneArg(rollupScrapeInterval),
 	"tmin_over_time":        newRollupFuncOneArg(rollupTmin),
 	"tmax_over_time":        newRollupFuncOneArg(rollupTmax),
+	"tfirst_over_time":      newRollupFuncOneArg(rollupTfirst),
+	"tlast_over_time":       newRollupFuncOneArg(rollupTlast),
 	"share_le_over_time":    newRollupShareLE,
 	"share_gt_over_time":    newRollupShareGT,
+	"count_le_over_time":    newRollupCountLE,
+	"count_gt_over_time":    newRollupCountGT,
+	"count_eq_over_time":    newRollupCountEQ,
+	"count_ne_over_time":    newRollupCountNE,
 	"histogram_over_time":   newRollupFuncOneArg(rollupHistogram),
 	"rollup":                newRollupFuncOneArg(rollupFake),
 	"rollup_rate":           newRollupFuncOneArg(rollupFake), // + rollupFuncsRemoveCounterResets
@@ -75,14 +80,17 @@ var rollupFuncs = map[string]newRollupFunc{
 	"hoeffding_bound_lower": newRollupHoeffdingBoundLower,
 	"ascent_over_time":      newRollupFuncOneArg(rollupAscentOverTime),
 	"descent_over_time":     newRollupFuncOneArg(rollupDescentOverTime),
+	"zscore_over_time":      newRollupFuncOneArg(rollupZScoreOverTime),
 
 	// `timestamp` function must return timestamp for the last datapoint on the current window
 	// in order to properly handle offset and timestamps unaligned to the current step.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/415 for details.
-	"timestamp": newRollupFuncOneArg(rollupTimestamp),
+	"timestamp": newRollupFuncOneArg(rollupTlast),
 
 	// See https://en.wikipedia.org/wiki/Mode_(statistics)
 	"mode_over_time": newRollupFuncOneArg(rollupModeOverTime),
+
+	"rate_over_sum": newRollupFuncOneArg(rollupRateOverSum),
 }
 
 // rollupAggrFuncs are functions that can be passed to `aggr_over_time()`
@@ -93,7 +101,7 @@ var rollupAggrFuncs = map[string]rollupFunc{
 	"deriv":            rollupDerivSlow,
 	"deriv_fast":       rollupDerivFast,
 	"idelta":           rollupIdelta,
-	"increase":         rollupIncrease,  // + rollupFuncsRemoveCounterResets
+	"increase":         rollupDelta,     // + rollupFuncsRemoveCounterResets
 	"irate":            rollupIderiv,    // + rollupFuncsRemoveCounterResets
 	"rate":             rollupDerivFast, // + rollupFuncsRemoveCounterResets
 	"resets":           rollupResets,
@@ -122,10 +130,14 @@ var rollupAggrFuncs = map[string]rollupFunc{
 	"scrape_interval":     rollupScrapeInterval,
 	"tmin_over_time":      rollupTmin,
 	"tmax_over_time":      rollupTmax,
+	"tfirst_over_time":    rollupTfirst,
+	"tlast_over_time":     rollupTlast,
 	"ascent_over_time":    rollupAscentOverTime,
 	"descent_over_time":   rollupDescentOverTime,
-	"timestamp":           rollupTimestamp,
+	"zscore_over_time":    rollupZScoreOverTime,
+	"timestamp":           rollupTlast,
 	"mode_over_time":      rollupModeOverTime,
+	"rate_over_sum":       rollupRateOverSum,
 }
 
 var rollupFuncsCannotAdjustWindow = map[string]bool{
@@ -136,6 +148,7 @@ var rollupFuncsCannotAdjustWindow = map[string]bool{
 	"increase":            true,
 	"predict_linear":      true,
 	"resets":              true,
+	"avg_over_time":       true,
 	"sum_over_time":       true,
 	"count_over_time":     true,
 	"quantile_over_time":  true,
@@ -150,6 +163,7 @@ var rollupFuncsCannotAdjustWindow = map[string]bool{
 	"integrate":           true,
 	"ascent_over_time":    true,
 	"descent_over_time":   true,
+	"zscore_over_time":    true,
 }
 
 var rollupFuncsRemoveCounterResets = map[string]bool{
@@ -161,6 +175,8 @@ var rollupFuncsRemoveCounterResets = map[string]bool{
 }
 
 var rollupFuncsKeepMetricGroup = map[string]bool{
+	"holt_winters":          true,
+	"predict_linear":        true,
 	"default_rollup":        true,
 	"avg_over_time":         true,
 	"min_over_time":         true,
@@ -248,15 +264,16 @@ func getRollupConfigs(name string, rf rollupFunc, expr metricsql.Expr, start, en
 	}
 	newRollupConfig := func(rf rollupFunc, tagValue string) *rollupConfig {
 		return &rollupConfig{
-			TagValue:        tagValue,
-			Func:            rf,
-			Start:           start,
-			End:             end,
-			Step:            step,
-			Window:          window,
-			MayAdjustWindow: !rollupFuncsCannotAdjustWindow[name],
-			LookbackDelta:   lookbackDelta,
-			Timestamps:      sharedTimestamps,
+			TagValue:          tagValue,
+			Func:              rf,
+			Start:             start,
+			End:               end,
+			Step:              step,
+			Window:            window,
+			MayAdjustWindow:   !rollupFuncsCannotAdjustWindow[name],
+			CanDropLastSample: name == "default_rollup",
+			LookbackDelta:     lookbackDelta,
+			Timestamps:        sharedTimestamps,
 		}
 	}
 	appendRollupConfigs := func(dst []*rollupConfig) []*rollupConfig {
@@ -315,18 +332,32 @@ func getRollupFunc(funcName string) newRollupFunc {
 }
 
 type rollupFuncArg struct {
-	prevValue     float64
+	// The value preceeding values if it fits staleness interval.
+	prevValue float64
+
+	// The timestamp for prevValue.
 	prevTimestamp int64
-	values        []float64
-	timestamps    []int64
 
-	currTimestamp int64
-	idx           int
-	step          int64
+	// Values that fit window ending at currTimestamp.
+	values []float64
 
-	// Real previous value even if it is located too far from the current window.
-	// It matches prevValue if prevValue is not nan.
+	// Timestamps for values.
+	timestamps []int64
+
+	// Real value preceeding values without restrictions on staleness interval.
 	realPrevValue float64
+
+	// Real value which goes after values.
+	realNextValue float64
+
+	// Current timestamp for rollup evaluation.
+	currTimestamp int64
+
+	// Index for the currently evaluated point relative to time range for query evaluation.
+	idx int
+
+	// Time window for rollup calculations.
+	window int64
 
 	tsm *timeseriesMap
 }
@@ -338,8 +369,7 @@ func (rfa *rollupFuncArg) reset() {
 	rfa.timestamps = nil
 	rfa.currTimestamp = 0
 	rfa.idx = 0
-	rfa.step = 0
-	rfa.realPrevValue = nan
+	rfa.window = 0
 	rfa.tsm = nil
 }
 
@@ -364,6 +394,11 @@ type rollupConfig struct {
 	// Without the adjustement their value would jump in unexpected directions
 	// when using window smaller than 2 x scrape_interval.
 	MayAdjustWindow bool
+
+	// Whether the last sample can be dropped during rollup calculations.
+	// The last sample can be dropped for `default_rollup()` function only.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/748 .
+	CanDropLastSample bool
 
 	Timestamps []int64
 
@@ -477,20 +512,28 @@ func (rc *rollupConfig) doInternal(dstValues []float64, tsm *timeseriesMap, valu
 	window := rc.Window
 	if window <= 0 {
 		window = rc.Step
+		if rc.CanDropLastSample && rc.LookbackDelta > 0 && window > rc.LookbackDelta {
+			// Implicitly window exceeds -search.maxStalenessInterval, so limit it to -search.maxStalenessInterval
+			// according to https://github.com/VictoriaMetrics/VictoriaMetrics/issues/784
+			window = rc.LookbackDelta
+		}
 	}
 	if rc.MayAdjustWindow && window < maxPrevInterval {
 		window = maxPrevInterval
 	}
 	rfa := getRollupFuncArg()
 	rfa.idx = 0
-	rfa.step = rc.Step
-	rfa.realPrevValue = nan
+	rfa.window = window
 	rfa.tsm = tsm
 
 	i := 0
 	j := 0
 	ni := 0
 	nj := 0
+	stalenessInterval := int64(float64(scrapeInterval) * 0.9)
+	// Do not drop trailing data points for queries, which return 2 or 1 point (aka instant queries).
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/845
+	canDropLastSample := rc.CanDropLastSample && len(rc.Timestamps) > 2
 	for _, tEnd := range rc.Timestamps {
 		tStart := tEnd - window
 		ni = seekFirstTimestampIdxAfter(timestamps[i:], tStart, ni)
@@ -507,13 +550,29 @@ func (rc *rollupConfig) doInternal(dstValues []float64, tsm *timeseriesMap, valu
 			rfa.prevValue = values[i-1]
 			rfa.prevTimestamp = timestamps[i-1]
 		}
-
 		rfa.values = values[i:j]
 		rfa.timestamps = timestamps[i:j]
-		rfa.currTimestamp = tEnd
+		if canDropLastSample && j == len(timestamps) && j > 0 && (tEnd-timestamps[j-1] > stalenessInterval || i == j && len(timestamps) == 1) {
+			// Drop trailing data points in the following cases:
+			// - if the distance between the last raw sample and tEnd exceeds stalenessInterval
+			// - if time series contains only a single raw sample
+			// This should prevent from double counting when a label changes in time series (for instance,
+			// during new deployment in K8S). See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/748
+			rfa.prevValue = nan
+			rfa.values = nil
+			rfa.timestamps = nil
+		}
 		if i > 0 {
 			rfa.realPrevValue = values[i-1]
+		} else {
+			rfa.realPrevValue = nan
 		}
+		if j < len(values) {
+			rfa.realNextValue = values[j]
+		} else {
+			rfa.realNextValue = nan
+		}
+		rfa.currTimestamp = tEnd
 		value := rc.Func(rfa)
 		rfa.idx++
 		dstValues = append(dstValues, value)
@@ -677,7 +736,7 @@ func derivValues(values []float64, timestamps []int64) {
 			values[i] = prevDeriv
 			continue
 		}
-		dt := float64(ts-prevTs) * 1e-3
+		dt := float64(ts-prevTs) / 1e3
 		prevDeriv = (v - prevValue) / dt
 		values[i] = prevDeriv
 		prevValue = v
@@ -797,7 +856,7 @@ func linearRegression(rfa *rollupFuncArg) (float64, float64) {
 		n = 0
 	}
 	for i, v := range values {
-		dt := float64(timestamps[i]-tFirst) * 1e-3
+		dt := float64(timestamps[i]-tFirst) / 1e3
 		vSum += v
 		tSum += dt
 		tvSum += dt * v
@@ -810,7 +869,7 @@ func linearRegression(rfa *rollupFuncArg) (float64, float64) {
 	k := (n*tvSum - tSum*vSum) / (n*ttSum - tSum*tSum)
 	v := (vSum - k*tSum) / n
 	// Adjust v to the last timestamp on the given time range.
-	v += k * (float64(timestamps[len(timestamps)-1]-tFirst) * 1e-3)
+	v += k * (float64(timestamps[len(timestamps)-1]-tFirst) / 1e3)
 	return v, k
 }
 
@@ -842,7 +901,54 @@ func countFilterGT(values []float64, gt float64) int {
 	return n
 }
 
+func countFilterEQ(values []float64, eq float64) int {
+	n := 0
+	for _, v := range values {
+		if v == eq {
+			n++
+		}
+	}
+	return n
+}
+
+func countFilterNE(values []float64, ne float64) int {
+	n := 0
+	for _, v := range values {
+		if v != ne {
+			n++
+		}
+	}
+	return n
+}
+
 func newRollupShareFilter(args []interface{}, countFilter func(values []float64, limit float64) int) (rollupFunc, error) {
+	rf, err := newRollupCountFilter(args, countFilter)
+	if err != nil {
+		return nil, err
+	}
+	return func(rfa *rollupFuncArg) float64 {
+		n := rf(rfa)
+		return n / float64(len(rfa.values))
+	}, nil
+}
+
+func newRollupCountLE(args []interface{}) (rollupFunc, error) {
+	return newRollupCountFilter(args, countFilterLE)
+}
+
+func newRollupCountGT(args []interface{}) (rollupFunc, error) {
+	return newRollupCountFilter(args, countFilterGT)
+}
+
+func newRollupCountEQ(args []interface{}) (rollupFunc, error) {
+	return newRollupCountFilter(args, countFilterEQ)
+}
+
+func newRollupCountNE(args []interface{}) (rollupFunc, error) {
+	return newRollupCountFilter(args, countFilterNE)
+}
+
+func newRollupCountFilter(args []interface{}, countFilter func(values []float64, limit float64) int) (rollupFunc, error) {
 	if err := expectRollupArgsNum(args, 2); err != nil {
 		return nil, err
 	}
@@ -858,8 +964,7 @@ func newRollupShareFilter(args []interface{}, countFilter func(values []float64,
 			return nan
 		}
 		limit := limits[rfa.idx]
-		n := countFilter(values, limit)
-		return float64(n) / float64(len(values))
+		return float64(countFilter(values, limit))
 	}
 	return rf, nil
 }
@@ -1044,7 +1149,7 @@ func rollupTmin(rfa *rollupFuncArg) float64 {
 			minTimestamp = timestamps[i]
 		}
 	}
-	return float64(minTimestamp) * 1e-3
+	return float64(minTimestamp) / 1e3
 }
 
 func rollupTmax(rfa *rollupFuncArg) float64 {
@@ -1063,7 +1168,33 @@ func rollupTmax(rfa *rollupFuncArg) float64 {
 			maxTimestamp = timestamps[i]
 		}
 	}
-	return float64(maxTimestamp) * 1e-3
+	return float64(maxTimestamp) / 1e3
+}
+
+func rollupTfirst(rfa *rollupFuncArg) float64 {
+	// There is no need in handling NaNs here, since they must be cleaned up
+	// before calling rollup funcs.
+	timestamps := rfa.timestamps
+	if len(timestamps) == 0 {
+		// Do not take into account rfa.prevTimestamp, since it may lead
+		// to inconsistent results comparing to Prometheus on broken time series
+		// with irregular data points.
+		return nan
+	}
+	return float64(timestamps[0]) / 1e3
+}
+
+func rollupTlast(rfa *rollupFuncArg) float64 {
+	// There is no need in handling NaNs here, since they must be cleaned up
+	// before calling rollup funcs.
+	timestamps := rfa.timestamps
+	if len(timestamps) == 0 {
+		// Do not take into account rfa.prevTimestamp, since it may lead
+		// to inconsistent results comparing to Prometheus on broken time series
+		// with irregular data points.
+		return nan
+	}
+	return float64(timestamps[len(timestamps)-1]) / 1e3
 }
 
 func rollupSum(rfa *rollupFuncArg) float64 {
@@ -1071,16 +1202,38 @@ func rollupSum(rfa *rollupFuncArg) float64 {
 	// before calling rollup funcs.
 	values := rfa.values
 	if len(values) == 0 {
-		if math.IsNaN(rfa.prevValue) {
-			return nan
-		}
-		return 0
+		// Do not take into account rfa.prevValue, since it may lead
+		// to inconsistent results comparing to Prometheus on broken time series
+		// with irregular data points.
+		return nan
 	}
 	var sum float64
 	for _, v := range values {
 		sum += v
 	}
 	return sum
+}
+
+func rollupRateOverSum(rfa *rollupFuncArg) float64 {
+	// There is no need in handling NaNs here, since they must be cleaned up
+	// before calling rollup funcs.
+	timestamps := rfa.timestamps
+	if len(timestamps) == 0 {
+		if math.IsNaN(rfa.prevValue) {
+			return nan
+		}
+		// Assume that the value didn't change since rfa.prevValue.
+		return 0
+	}
+	dt := rfa.window
+	if !math.IsNaN(rfa.prevValue) {
+		dt = timestamps[len(timestamps)-1] - rfa.prevTimestamp
+	}
+	sum := float64(0)
+	for _, v := range rfa.values {
+		sum += v
+	}
+	return sum / (float64(dt) / 1e3)
 }
 
 func rollupRange(rfa *rollupFuncArg) float64 {
@@ -1171,14 +1324,6 @@ func rollupStdvar(rfa *rollupFuncArg) float64 {
 }
 
 func rollupDelta(rfa *rollupFuncArg) float64 {
-	return rollupDeltaInternal(rfa, false)
-}
-
-func rollupIncrease(rfa *rollupFuncArg) float64 {
-	return rollupDeltaInternal(rfa, true)
-}
-
-func rollupDeltaInternal(rfa *rollupFuncArg, canUseRealPrevValue bool) float64 {
 	// There is no need in handling NaNs here, since they must be cleaned up
 	// before calling rollup funcs.
 	values := rfa.values
@@ -1187,18 +1332,38 @@ func rollupDeltaInternal(rfa *rollupFuncArg, canUseRealPrevValue bool) float64 {
 		if len(values) == 0 {
 			return nan
 		}
-		// Assume that the previous non-existing value was 0
-		// only if the first value is quite small.
+		if !math.IsNaN(rfa.realPrevValue) {
+			// Assume that the value didn't change during the current gap.
+			// This should fix high delta() and increase() values at the end of gaps.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/894
+			return values[len(values)-1] - rfa.realPrevValue
+		}
+		// Assume that the previous non-existing value was 0 only in the following cases:
+		//
+		// - If the delta with the next value equals to 0.
+		//   This is the case for slow-changing counter - see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/962
+		// - If the first value doesn't exceed too much the delta with the next value.
+		//
 		// This should prevent from improper increase() results for os-level counters
 		// such as cpu time or bytes sent over the network interface.
 		// These counters may start long ago before the first value appears in the db.
-		if values[0] < 1e6 {
+		//
+		// This also should prevent from improper increase() results when a part of label values are changed
+		// without counter reset.
+		var d float64
+		if len(values) > 1 {
+			d = values[1] - values[0]
+		} else if !math.IsNaN(rfa.realNextValue) {
+			d = rfa.realNextValue - values[0]
+		}
+		if d == 0 {
+			d = 10
+		}
+		if math.Abs(values[0]) < 10*(math.Abs(d)+1) {
 			prevValue = 0
-			if canUseRealPrevValue && !math.IsNaN(rfa.realPrevValue) {
-				prevValue = rfa.realPrevValue
-			}
 		} else {
 			prevValue = values[0]
+			values = values[1:]
 		}
 	}
 	if len(values) == 0 {
@@ -1272,7 +1437,7 @@ func rollupDerivFast(rfa *rollupFuncArg) float64 {
 	vEnd := values[len(values)-1]
 	tEnd := timestamps[len(timestamps)-1]
 	dv := vEnd - prevValue
-	dt := float64(tEnd-prevTimestamp) * 1e-3
+	dt := float64(tEnd-prevTimestamp) / 1e3
 	return dv / dt
 }
 
@@ -1298,7 +1463,7 @@ func rollupIderiv(rfa *rollupFuncArg) float64 {
 			// So just return nan
 			return nan
 		}
-		return (values[0] - rfa.prevValue) / (float64(timestamps[0]-rfa.prevTimestamp) * 1e-3)
+		return (values[0] - rfa.prevValue) / (float64(timestamps[0]-rfa.prevTimestamp) / 1e3)
 	}
 	vEnd := values[len(values)-1]
 	tEnd := timestamps[len(timestamps)-1]
@@ -1322,7 +1487,7 @@ func rollupIderiv(rfa *rollupFuncArg) float64 {
 	}
 	dv := vEnd - vStart
 	dt := tEnd - tStart
-	return dv / (float64(dt) * 1e-3)
+	return dv / (float64(dt) / 1e3)
 }
 
 func rollupLifetime(rfa *rollupFuncArg) float64 {
@@ -1332,12 +1497,12 @@ func rollupLifetime(rfa *rollupFuncArg) float64 {
 		if len(timestamps) < 2 {
 			return nan
 		}
-		return float64(timestamps[len(timestamps)-1]-timestamps[0]) * 1e-3
+		return float64(timestamps[len(timestamps)-1]-timestamps[0]) / 1e3
 	}
 	if len(timestamps) == 0 {
 		return nan
 	}
-	return float64(timestamps[len(timestamps)-1]-rfa.prevTimestamp) * 1e-3
+	return float64(timestamps[len(timestamps)-1]-rfa.prevTimestamp) / 1e3
 }
 
 func rollupLag(rfa *rollupFuncArg) float64 {
@@ -1347,9 +1512,9 @@ func rollupLag(rfa *rollupFuncArg) float64 {
 		if math.IsNaN(rfa.prevValue) {
 			return nan
 		}
-		return float64(rfa.currTimestamp-rfa.prevTimestamp) * 1e-3
+		return float64(rfa.currTimestamp-rfa.prevTimestamp) / 1e3
 	}
-	return float64(rfa.currTimestamp-timestamps[len(timestamps)-1]) * 1e-3
+	return float64(rfa.currTimestamp-timestamps[len(timestamps)-1]) / 1e3
 }
 
 func rollupScrapeInterval(rfa *rollupFuncArg) float64 {
@@ -1359,12 +1524,12 @@ func rollupScrapeInterval(rfa *rollupFuncArg) float64 {
 		if len(timestamps) < 2 {
 			return nan
 		}
-		return float64(timestamps[len(timestamps)-1]-timestamps[0]) * 1e-3 / float64(len(timestamps)-1)
+		return (float64(timestamps[len(timestamps)-1]-timestamps[0]) / 1e3) / float64(len(timestamps)-1)
 	}
 	if len(timestamps) == 0 {
 		return nan
 	}
-	return (float64(timestamps[len(timestamps)-1]-rfa.prevTimestamp) * 1e-3) / float64(len(timestamps))
+	return (float64(timestamps[len(timestamps)-1]-rfa.prevTimestamp) / 1e3) / float64(len(timestamps))
 }
 
 func rollupChanges(rfa *rollupFuncArg) float64 {
@@ -1465,7 +1630,7 @@ func getCandlestickValues(rfa *rollupFuncArg) []float64 {
 }
 
 func getFirstValueForCandlestick(rfa *rollupFuncArg) float64 {
-	if rfa.prevTimestamp+rfa.step >= rfa.currTimestamp {
+	if rfa.prevTimestamp+rfa.window >= rfa.currTimestamp {
 		return rfa.prevValue
 	}
 	return nan
@@ -1527,43 +1692,26 @@ func rollupLow(rfa *rollupFuncArg) float64 {
 	return min
 }
 
-func rollupTimestamp(rfa *rollupFuncArg) float64 {
-	// There is no need in handling NaNs here, since they must be cleaned up
-	// before calling rollup funcs.
-	timestamps := rfa.timestamps
-	if len(timestamps) == 0 {
-		// Do not take into account rfa.prevTimestamp, since it may lead
-		// to inconsistent results comparing to Prometheus on broken time series
-		// with irregular data points.
-		return nan
-	}
-	return float64(timestamps[len(timestamps)-1]) / 1e3
-}
-
 func rollupModeOverTime(rfa *rollupFuncArg) float64 {
 	// There is no need in handling NaNs here, since they must be cleaned up
 	// before calling rollup funcs.
-	values := rfa.values
-	prevValue := rfa.prevValue
-	if len(values) == 0 {
-		return prevValue
-	}
-	sort.Float64s(values)
-	j := -1
-	dMax := 0
-	mode := prevValue
-	for i, v := range values {
-		if prevValue == v {
-			continue
-		}
-		if d := i - j; d > dMax {
-			dMax = d
-			mode = prevValue
-		}
-		j = i
-		prevValue = v
-	}
-	return mode
+
+	// Copy rfa.values to a.A, since modeNoNaNs modifies a.A contents.
+	a := float64sPool.Get().(*float64s)
+	a.A = append(a.A[:0], rfa.values...)
+	result := modeNoNaNs(rfa.prevValue, a.A)
+	float64sPool.Put(a)
+	return result
+}
+
+var float64sPool = &sync.Pool{
+	New: func() interface{} {
+		return &float64s{}
+	},
+}
+
+type float64s struct {
+	A []float64
 }
 
 func rollupAscentOverTime(rfa *rollupFuncArg) float64 {
@@ -1612,6 +1760,20 @@ func rollupDescentOverTime(rfa *rollupFuncArg) float64 {
 	return s
 }
 
+func rollupZScoreOverTime(rfa *rollupFuncArg) float64 {
+	// See https://about.gitlab.com/blog/2019/07/23/anomaly-detection-using-prometheus/#using-z-score-for-anomaly-detection
+	scrapeInterval := rollupScrapeInterval(rfa)
+	lag := rollupLag(rfa)
+	if math.IsNaN(scrapeInterval) || math.IsNaN(lag) || lag > scrapeInterval {
+		return nan
+	}
+	d := rollupLast(rfa) - rollupAvg(rfa)
+	if d == 0 {
+		return 0
+	}
+	return d / rollupStddev(rfa)
+}
+
 func rollupFirst(rfa *rollupFuncArg) float64 {
 	// There is no need in handling NaNs here, since they must be cleaned up
 	// before calling rollup funcs.
@@ -1658,37 +1820,32 @@ func rollupDistinct(rfa *rollupFuncArg) float64 {
 }
 
 func rollupIntegrate(rfa *rollupFuncArg) float64 {
-	prevTimestamp := rfa.prevTimestamp
-
 	// There is no need in handling NaNs here, since they must be cleaned up
 	// before calling rollup funcs.
 	values := rfa.values
 	timestamps := rfa.timestamps
-	if len(values) == 0 {
-		if math.IsNaN(rfa.prevValue) {
+	prevValue := rfa.prevValue
+	prevTimestamp := rfa.currTimestamp - rfa.window
+	if math.IsNaN(prevValue) {
+		if len(values) == 0 {
 			return nan
 		}
-		return 0
-	}
-	prevValue := rfa.prevValue
-	if math.IsNaN(prevValue) {
 		prevValue = values[0]
 		prevTimestamp = timestamps[0]
 		values = values[1:]
 		timestamps = timestamps[1:]
 	}
-	if len(values) == 0 {
-		return 0
-	}
 
 	var sum float64
 	for i, v := range values {
 		timestamp := timestamps[i]
-		dt := float64(timestamp-prevTimestamp) * 1e-3
-		sum += 0.5 * (v + prevValue) * dt
+		dt := float64(timestamp-prevTimestamp) / 1e3
+		sum += prevValue * dt
 		prevTimestamp = timestamp
 		prevValue = v
 	}
+	dt := float64(rfa.currTimestamp-prevTimestamp) / 1e3
+	sum += prevValue * dt
 	return sum
 }
 

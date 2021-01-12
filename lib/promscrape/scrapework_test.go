@@ -11,16 +11,45 @@ import (
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
 )
 
+func TestPromLabelsString(t *testing.T) {
+	f := func(labels []prompbmarshal.Label, resultExpected string) {
+		t.Helper()
+		result := promLabelsString(labels)
+		if result != resultExpected {
+			t.Fatalf("unexpected result; got\n%s\nwant\n%s", result, resultExpected)
+		}
+	}
+	f([]prompbmarshal.Label{}, "{}")
+	f([]prompbmarshal.Label{
+		{
+			Name:  "foo",
+			Value: "bar",
+		},
+	}, `{foo="bar"}`)
+	f([]prompbmarshal.Label{
+		{
+			Name:  "foo",
+			Value: "bar",
+		},
+		{
+			Name:  "a",
+			Value: `"b"`,
+		},
+	}, `{foo="bar",a="\"b\""}`)
+}
+
 func TestScrapeWorkScrapeInternalFailure(t *testing.T) {
 	dataExpected := `
 		up 0 123
 		scrape_samples_scraped 0 123
 		scrape_duration_seconds 0 123
 		scrape_samples_post_metric_relabeling 0 123
+		scrape_series_added 0 123
 `
 	timeseriesExpected := parseData(dataExpected)
 
 	var sw scrapeWork
+	sw.Config = &ScrapeWork{}
 
 	readDataCalls := 0
 	sw.ReadData = func(dst []byte) ([]byte, error) {
@@ -37,8 +66,8 @@ func TestScrapeWorkScrapeInternalFailure(t *testing.T) {
 		pushDataCalls++
 	}
 
-	timestamp := int64(123)
-	if err := sw.scrapeInternal(timestamp); err == nil {
+	timestamp := int64(123000)
+	if err := sw.scrapeInternal(timestamp, timestamp); err == nil {
 		t.Fatalf("expecting non-nil error")
 	}
 	if pushDataErr != nil {
@@ -59,7 +88,7 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		timeseriesExpected := parseData(dataExpected)
 
 		var sw scrapeWork
-		sw.Config = *cfg
+		sw.Config = cfg
 
 		readDataCalls := 0
 		sw.ReadData = func(dst []byte) ([]byte, error) {
@@ -71,14 +100,21 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		pushDataCalls := 0
 		var pushDataErr error
 		sw.PushData = func(wr *prompbmarshal.WriteRequest) {
-			if err := expectEqualTimeseries(wr.Timeseries, timeseriesExpected); err != nil {
-				pushDataErr = fmt.Errorf("unexpected data pushed: %w\ngot\n%#v\nwant\n%#v", err, wr.Timeseries, timeseriesExpected)
-			}
 			pushDataCalls++
+			if len(wr.Timeseries) > len(timeseriesExpected) {
+				pushDataErr = fmt.Errorf("too many time series obtained; got %d; want %d", len(wr.Timeseries), len(timeseriesExpected))
+				return
+			}
+			tsExpected := timeseriesExpected[:len(wr.Timeseries)]
+			timeseriesExpected = timeseriesExpected[len(tsExpected):]
+			if err := expectEqualTimeseries(wr.Timeseries, tsExpected); err != nil {
+				pushDataErr = fmt.Errorf("unexpected data pushed: %w\ngot\n%v\nwant\n%v", err, wr.Timeseries, tsExpected)
+				return
+			}
 		}
 
-		timestamp := int64(123)
-		if err := sw.scrapeInternal(timestamp); err != nil {
+		timestamp := int64(123000)
+		if err := sw.scrapeInternal(timestamp, timestamp); err != nil {
 			t.Fatalf("unexpected error: %s", err)
 		}
 		if pushDataErr != nil {
@@ -87,8 +123,8 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		if readDataCalls != 1 {
 			t.Fatalf("unexpected number of readData calls; got %d; want %d", readDataCalls, 1)
 		}
-		if pushDataCalls != 1 {
-			t.Fatalf("unexpected number of pushData calls; got %d; want %d", pushDataCalls, 1)
+		if pushDataCalls == 0 {
+			t.Fatalf("missing pushData calls")
 		}
 	}
 
@@ -97,6 +133,7 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		scrape_samples_scraped 0 123
 		scrape_duration_seconds 0 123
 		scrape_samples_post_metric_relabeling 0 123
+		scrape_series_added 0 123
 	`)
 	f(`
 		foo{bar="baz",empty_label=""} 34.45 3
@@ -108,6 +145,7 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		scrape_samples_scraped 2 123
 		scrape_duration_seconds 0 123
 		scrape_samples_post_metric_relabeling 2 123
+		scrape_series_added 2 123
 	`)
 	f(`
 		foo{bar="baz"} 34.45 3
@@ -127,6 +165,7 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		scrape_samples_scraped{foo="x"} 2 123
 		scrape_duration_seconds{foo="x"} 0 123
 		scrape_samples_post_metric_relabeling{foo="x"} 2 123
+		scrape_series_added{foo="x"} 2 123
 	`)
 	f(`
 		foo{job="orig",bar="baz"} 34.45
@@ -146,6 +185,7 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		scrape_samples_scraped{job="override"} 2 123
 		scrape_duration_seconds{job="override"} 0 123
 		scrape_samples_post_metric_relabeling{job="override"} 2 123
+		scrape_series_added{job="override"} 2 123
 	`)
 	// Empty instance override. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/453
 	f(`
@@ -170,6 +210,7 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		scrape_samples_scraped{instance="foobar",job="xxx"} 2 123
 		scrape_duration_seconds{instance="foobar",job="xxx"} 0 123
 		scrape_samples_post_metric_relabeling{instance="foobar",job="xxx"} 2 123
+		scrape_series_added{instance="foobar",job="xxx"} 2 123
 	`)
 	f(`
 		no_instance{instance="",job="some_job",label="val1",test=""} 5555
@@ -193,6 +234,7 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		scrape_samples_scraped{instance="foobar",job="xxx"} 2 123
 		scrape_duration_seconds{instance="foobar",job="xxx"} 0 123
 		scrape_samples_post_metric_relabeling{instance="foobar",job="xxx"} 2 123
+		scrape_series_added{instance="foobar",job="xxx"} 2 123
 	`)
 	f(`
 		foo{job="orig",bar="baz"} 34.45
@@ -212,6 +254,7 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		scrape_samples_scraped{job="override"} 2 123
 		scrape_duration_seconds{job="override"} 0 123
 		scrape_samples_post_metric_relabeling{job="override"} 2 123
+		scrape_series_added{job="override"} 2 123
 	`)
 	f(`
 		foo{bar="baz"} 34.44
@@ -249,6 +292,7 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		scrape_samples_scraped{job="xx"} 2 123
 		scrape_duration_seconds{job="xx"} 0 123
 		scrape_samples_post_metric_relabeling{job="xx"} 2 123
+		scrape_series_added{job="xx"} 2 123
 	`)
 	f(`
 		foo{bar="baz"} 34.44
@@ -285,6 +329,7 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		scrape_samples_scraped{job="xx",instance="foo.com"} 4 123
 		scrape_duration_seconds{job="xx",instance="foo.com"} 0 123
 		scrape_samples_post_metric_relabeling{job="xx",instance="foo.com"} 1 123
+		scrape_series_added{job="xx",instance="foo.com"} 1 123
 	`)
 	f(`
 		foo{bar="baz"} 34.44
@@ -297,6 +342,7 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		scrape_samples_scraped 2 123
 		scrape_duration_seconds 0 123
 		scrape_samples_post_metric_relabeling 0 123
+		scrape_series_added 0 123
 	`)
 }
 
@@ -348,7 +394,7 @@ func expectEqualTimeseries(tss, tssExpected []prompbmarshal.TimeSeries) error {
 	for k, tsExpected := range mExpected {
 		ts := m[k]
 		if ts != tsExpected {
-			return fmt.Errorf("unexpected timeseries %q; got\n%s\nwant\n%s", k, ts, tsExpected)
+			return fmt.Errorf("unexpected timeseries %q;\ngot\n%s\nwant\n%s", k, ts, tsExpected)
 		}
 	}
 	return nil

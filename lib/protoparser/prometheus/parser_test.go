@@ -1,6 +1,7 @@
 package prometheus
 
 import (
+	"math"
 	"reflect"
 	"testing"
 )
@@ -129,6 +130,13 @@ func TestRowsUnmarshalFailure(t *testing.T) {
 	f(" aaa ")
 	f(" aaa   \n")
 	f(` aa{foo="bar"}   ` + "\n")
+
+	// Invalid value
+	f("foo bar")
+	f("foo bar 124")
+
+	// Invalid timestamp
+	f("foo 123 bar")
 }
 
 func TestRowsUnmarshalSuccess(t *testing.T) {
@@ -170,23 +178,118 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 		Rows: []Row{{
 			Metric:    "foobar",
 			Value:     123.456,
-			Timestamp: 789,
+			Timestamp: 789000,
 		}},
 	})
-	f("foobar{} 123.456 789\n", &Rows{
+	f("foobar{} 123.456 789.4354\n", &Rows{
 		Rows: []Row{{
 			Metric:    "foobar",
 			Value:     123.456,
-			Timestamp: 789,
+			Timestamp: 789435,
+		}},
+	})
+	f(`#                                    _                                            _
+#   ___ __ _ ___ ___  __ _ _ __   __| |_ __ __ _        _____  ___ __   ___  _ __| |_ ___ _ __
+`+"#  / __/ _` / __/ __|/ _` | '_ \\ / _` | '__/ _` |_____ / _ \\ \\/ / '_ \\ / _ \\| '__| __/ _ \\ '__|\n"+`
+# | (_| (_| \__ \__ \ (_| | | | | (_| | | | (_| |_____|  __/>  <| |_) | (_) | |  | ||  __/ |
+#  \___\__,_|___/___/\__,_|_| |_|\__,_|_|  \__,_|      \___/_/\_\ .__/ \___/|_|   \__\___|_|
+#                                                               |_|
+#
+# TYPE cassandra_token_ownership_ratio gauge
+cassandra_token_ownership_ratio 78.9`, &Rows{
+		Rows: []Row{{
+			Metric: "cassandra_token_ownership_ratio",
+			Value:  78.9,
 		}},
 	})
 
-	// Timestamp bigger than 1<<31
+	// Exemplars - see https://github.com/OpenObservability/OpenMetrics/blob/master/OpenMetrics.md#exemplars-1
+	f(`foo_bucket{le="10",a="#b"} 17 # {trace_id="oHg5SJ#YRHA0"} 9.8 1520879607.789
+	   abc 123 456 # foobar
+	   foo   344#bar`, &Rows{
+		Rows: []Row{
+			{
+				Metric: "foo_bucket",
+				Tags: []Tag{
+					{
+						Key:   "le",
+						Value: "10",
+					},
+					{
+						Key:   "a",
+						Value: "#b",
+					},
+				},
+				Value: 17,
+			},
+			{
+				Metric:    "abc",
+				Value:     123,
+				Timestamp: 456000,
+			},
+			{
+				Metric: "foo",
+				Value:  344,
+			},
+		},
+	})
+
+	// "Infinity" word - this has been added in OpenMetrics.
+	// See https://github.com/OpenObservability/OpenMetrics/blob/master/OpenMetrics.md
+	// Checks for https://github.com/VictoriaMetrics/VictoriaMetrics/issues/924
+	inf := math.Inf(1)
+	f(`
+		foo Infinity
+		bar +Infinity
+		baz -infinity
+		aaa +inf
+		bbb -INF
+		ccc INF
+	`, &Rows{
+		Rows: []Row{
+			{
+				Metric: "foo",
+				Value:  inf,
+			},
+			{
+				Metric: "bar",
+				Value:  inf,
+			},
+			{
+				Metric: "baz",
+				Value:  -inf,
+			},
+			{
+				Metric: "aaa",
+				Value:  inf,
+			},
+			{
+				Metric: "bbb",
+				Value:  -inf,
+			},
+			{
+				Metric: "ccc",
+				Value:  inf,
+			},
+		},
+	})
+
+	// Timestamp bigger than 1<<31.
+	// It should be parsed in milliseconds.
 	f("aaa 1123 429496729600", &Rows{
 		Rows: []Row{{
 			Metric:    "aaa",
 			Value:     1123,
 			Timestamp: 429496729600,
+		}},
+	})
+
+	// Floating-point timestamps in OpenMetric format.
+	f("aaa 1123 42949.567", &Rows{
+		Rows: []Row{{
+			Metric:    "aaa",
+			Value:     1123,
+			Timestamp: 42949567,
 		}},
 	})
 
@@ -199,7 +302,7 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 				Value: "baz",
 			}},
 			Value:     1,
-			Timestamp: 2,
+			Timestamp: 2000,
 		}},
 	})
 	f(`foo{bar="b\"a\\z"} -1.2`, &Rows{
@@ -231,7 +334,7 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 				},
 			},
 			Value:     1,
-			Timestamp: 2,
+			Timestamp: 2000,
 		}},
 	})
 
@@ -245,7 +348,7 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 				Value: "baz",
 			}},
 			Value:     1,
-			Timestamp: 2,
+			Timestamp: 2000,
 		}},
 	})
 
@@ -255,7 +358,7 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 			{
 				Metric:    "foo",
 				Value:     0.3,
-				Timestamp: 2,
+				Timestamp: 2000,
 			},
 			{
 				Metric: "aaa",
@@ -264,7 +367,7 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 			{
 				Metric:    "bar.baz",
 				Value:     0.34,
-				Timestamp: 43,
+				Timestamp: 43000,
 			},
 		},
 	})
@@ -275,12 +378,12 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 			{
 				Metric:    "foo",
 				Value:     0.3,
-				Timestamp: 2,
+				Timestamp: 2000,
 			},
 			{
 				Metric:    "bar.baz",
 				Value:     0.34,
-				Timestamp: 43,
+				Timestamp: 43000,
 			},
 		},
 	})

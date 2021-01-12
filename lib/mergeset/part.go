@@ -78,30 +78,15 @@ func openFilePart(path string) (*part, error) {
 	metaindexSize := fs.MustFileSize(metaindexPath)
 
 	indexPath := path + "/index.bin"
-	indexFile, err := fs.OpenReaderAt(indexPath)
-	if err != nil {
-		metaindexFile.MustClose()
-		return nil, fmt.Errorf("cannot open %q: %w", indexPath, err)
-	}
+	indexFile := fs.MustOpenReaderAt(indexPath)
 	indexSize := fs.MustFileSize(indexPath)
 
 	itemsPath := path + "/items.bin"
-	itemsFile, err := fs.OpenReaderAt(itemsPath)
-	if err != nil {
-		metaindexFile.MustClose()
-		indexFile.MustClose()
-		return nil, fmt.Errorf("cannot open %q: %w", itemsPath, err)
-	}
+	itemsFile := fs.MustOpenReaderAt(itemsPath)
 	itemsSize := fs.MustFileSize(itemsPath)
 
 	lensPath := path + "/lens.bin"
-	lensFile, err := fs.OpenReaderAt(lensPath)
-	if err != nil {
-		metaindexFile.MustClose()
-		indexFile.MustClose()
-		itemsFile.MustClose()
-		return nil, fmt.Errorf("cannot open %q: %w", lensPath, err)
-	}
+	lensFile := fs.MustOpenReaderAt(lensPath)
 	lensSize := fs.MustFileSize(lensPath)
 
 	size := metaindexSize + indexSize + itemsSize + lensSize
@@ -231,8 +216,8 @@ func (idxbc *indexBlockCache) cleanByTimeout() {
 	currentTime := fasttime.UnixTimestamp()
 	idxbc.mu.Lock()
 	for k, idxbe := range idxbc.m {
-		// Delete items accessed more than 10 minutes ago.
-		if currentTime-atomic.LoadUint64(&idxbe.lastAccessTime) > 10*60 {
+		// Delete items accessed more than a minute ago.
+		if currentTime-atomic.LoadUint64(&idxbe.lastAccessTime) > 60 {
 			delete(idxbc.m, k)
 		}
 	}
@@ -260,7 +245,7 @@ func (idxbc *indexBlockCache) Get(k uint64) *indexBlock {
 func (idxbc *indexBlockCache) Put(k uint64, idxb *indexBlock) {
 	idxbc.mu.Lock()
 
-	// Remove superflouos entries.
+	// Remove superfluous entries.
 	if overflow := len(idxbc.m) - getMaxCachedIndexBlocksPerPart(); overflow > 0 {
 		// Remove 10% of items from the cache.
 		overflow = int(float64(len(idxbc.m)) * 0.1)
@@ -378,8 +363,8 @@ func (ibc *inmemoryBlockCache) cleanByTimeout() {
 	currentTime := fasttime.UnixTimestamp()
 	ibc.mu.Lock()
 	for k, ibe := range ibc.m {
-		// Delete items accessed more than 10 minutes ago.
-		if currentTime-atomic.LoadUint64(&ibe.lastAccessTime) > 10*60 {
+		// Delete items accessed more than a minute ago.
+		if currentTime-atomic.LoadUint64(&ibe.lastAccessTime) > 60 {
 			delete(ibc.m, k)
 		}
 	}
@@ -408,7 +393,7 @@ func (ibc *inmemoryBlockCache) Get(k inmemoryBlockCacheKey) *inmemoryBlock {
 func (ibc *inmemoryBlockCache) Put(k inmemoryBlockCacheKey, ib *inmemoryBlock) {
 	ibc.mu.Lock()
 
-	// Clean superflouos entries in cache.
+	// Clean superfluous entries in cache.
 	if overflow := len(ibc.m) - getMaxCachedInmemoryBlocksPerPart(); overflow > 0 {
 		// Remove 10% of items from the cache.
 		overflow = int(float64(len(ibc.m)) * 0.1)

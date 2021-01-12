@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/md5"
 	"fmt"
 	"hash/fnv"
 	"io/ioutil"
@@ -10,6 +11,9 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envtemplate"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/metricsql"
 	"gopkg.in/yaml.v2"
 )
@@ -22,9 +26,28 @@ type Group struct {
 	Interval    time.Duration `yaml:"interval,omitempty"`
 	Rules       []Rule        `yaml:"rules"`
 	Concurrency int           `yaml:"concurrency"`
+	// Checksum stores the hash of yaml definition for this group.
+	// May be used to detect any changes like rules re-ordering etc.
+	Checksum string
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (g *Group) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type group Group
+	if err := unmarshal((*group)(g)); err != nil {
+		return err
+	}
+	b, err := yaml.Marshal(g)
+	if err != nil {
+		return fmt.Errorf("failed to marshal group configuration for checksum: %w", err)
+	}
+	h := md5.New()
+	h.Write(b)
+	g.Checksum = fmt.Sprintf("%x", h.Sum(nil))
+	return nil
 }
 
 // Validate check for internal Group or Rule configuration errors
@@ -72,12 +95,48 @@ type Rule struct {
 	Record      string            `yaml:"record,omitempty"`
 	Alert       string            `yaml:"alert,omitempty"`
 	Expr        string            `yaml:"expr"`
-	For         time.Duration     `yaml:"for,omitempty"`
+	For         PromDuration      `yaml:"for"`
 	Labels      map[string]string `yaml:"labels,omitempty"`
 	Annotations map[string]string `yaml:"annotations,omitempty"`
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
+}
+
+// PromDuration is Prometheus duration.
+type PromDuration struct {
+	milliseconds int64
+}
+
+// NewPromDuration returns PromDuration for given d.
+func NewPromDuration(d time.Duration) PromDuration {
+	return PromDuration{
+		milliseconds: d.Milliseconds(),
+	}
+}
+
+// MarshalYAML implements yaml.Marshaler interface.
+func (pd PromDuration) MarshalYAML() (interface{}, error) {
+	return pd.Duration().String(), nil
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler interface.
+func (pd *PromDuration) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+	ms, err := metricsql.DurationValue(s, 0)
+	if err != nil {
+		return err
+	}
+	pd.milliseconds = ms
+	return nil
+}
+
+// Duration returns duration for pd.
+func (pd *PromDuration) Duration() time.Duration {
+	return time.Duration(pd.milliseconds) * time.Millisecond
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -90,8 +149,16 @@ func (r *Rule) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
+// Name returns Rule name according to its type
+func (r *Rule) Name() string {
+	if r.Record != "" {
+		return r.Record
+	}
+	return r.Alert
+}
+
 // HashRule hashes significant Rule fields into
-// unique hash value
+// unique hash that supposed to define Rule uniqueness
 func HashRule(r Rule) uint64 {
 	h := fnv.New64a()
 	h.Write([]byte(r.Expr))
@@ -102,16 +169,7 @@ func HashRule(r Rule) uint64 {
 		h.Write([]byte("alerting"))
 		h.Write([]byte(r.Alert))
 	}
-	type item struct {
-		key, value string
-	}
-	var kv []item
-	for k, v := range r.Labels {
-		kv = append(kv, item{key: k, value: v})
-	}
-	sort.Slice(kv, func(i, j int) bool {
-		return kv[i].key < kv[j].key
-	})
+	kv := sortMap(r.Labels)
 	for _, i := range kv {
 		h.Write([]byte(i.key))
 		h.Write([]byte(i.value))
@@ -141,27 +199,34 @@ func Parse(pathPatterns []string, validateAnnotations, validateExpressions bool)
 		}
 		fp = append(fp, matches...)
 	}
+	errGroup := new(utils.ErrGroup)
 	var groups []Group
 	for _, file := range fp {
 		uniqueGroups := map[string]struct{}{}
 		gr, err := parseFile(file)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse file %q: %w", file, err)
+			errGroup.Add(fmt.Errorf("failed to parse file %q: %w", file, err))
+			continue
 		}
 		for _, g := range gr {
 			if err := g.Validate(validateAnnotations, validateExpressions); err != nil {
-				return nil, fmt.Errorf("invalid group %q in file %q: %w", g.Name, file, err)
+				errGroup.Add(fmt.Errorf("invalid group %q in file %q: %w", g.Name, file, err))
+				continue
 			}
 			if _, ok := uniqueGroups[g.Name]; ok {
-				return nil, fmt.Errorf("group name %q duplicate in file %q", g.Name, file)
+				errGroup.Add(fmt.Errorf("group name %q duplicate in file %q", g.Name, file))
+				continue
 			}
 			uniqueGroups[g.Name] = struct{}{}
 			g.File = file
 			groups = append(groups, g)
 		}
 	}
+	if err := errGroup.Err(); err != nil {
+		return nil, err
+	}
 	if len(groups) < 1 {
-		return nil, fmt.Errorf("no groups found in %s", strings.Join(pathPatterns, ";"))
+		logger.Warnf("no groups found in %s", strings.Join(pathPatterns, ";"))
 	}
 	return groups, nil
 }
@@ -171,6 +236,7 @@ func parseFile(path string) ([]Group, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error reading alert rule file: %w", err)
 	}
+	data = envtemplate.Replace(data)
 	g := struct {
 		Groups []Group `yaml:"groups"`
 		// Catches all undefined fields and must be empty after parsing.
@@ -192,4 +258,19 @@ func checkOverflow(m map[string]interface{}, ctx string) error {
 		return fmt.Errorf("unknown fields in %s: %s", ctx, strings.Join(keys, ", "))
 	}
 	return nil
+}
+
+type item struct {
+	key, value string
+}
+
+func sortMap(m map[string]string) []item {
+	var kv []item
+	for k, v := range m {
+		kv = append(kv, item{key: k, value: v})
+	}
+	sort.Slice(kv, func(i, j int) bool {
+		return kv[i].key < kv[j].key
+	})
+	return kv
 }

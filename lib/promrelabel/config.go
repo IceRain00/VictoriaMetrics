@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envtemplate"
 	"gopkg.in/yaml.v2"
 )
 
@@ -13,13 +14,13 @@ import (
 //
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config
 type RelabelConfig struct {
-	SourceLabels []string `yaml:"source_labels"`
-	Separator    *string  `yaml:"separator"`
-	TargetLabel  string   `yaml:"target_label"`
-	Regex        *string  `yaml:"regex"`
-	Modulus      uint64   `yaml:"modulus"`
-	Replacement  *string  `yaml:"replacement"`
-	Action       string   `yaml:"action"`
+	SourceLabels []string `yaml:"source_labels,flow,omitempty"`
+	Separator    *string  `yaml:"separator,omitempty"`
+	TargetLabel  string   `yaml:"target_label,omitempty"`
+	Regex        *string  `yaml:"regex,omitempty"`
+	Modulus      uint64   `yaml:"modulus,omitempty"`
+	Replacement  *string  `yaml:"replacement,omitempty"`
+	Action       string   `yaml:"action,omitempty"`
 }
 
 // LoadRelabelConfigs loads relabel configs from the given path.
@@ -28,6 +29,7 @@ func LoadRelabelConfigs(path string) ([]ParsedRelabelConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot read `relabel_configs` from %q: %w", path, err)
 	}
+	data = envtemplate.Replace(data)
 	var rcs []RelabelConfig
 	if err := yaml.UnmarshalStrict(data, &rcs); err != nil {
 		return nil, fmt.Errorf("cannot unmarshal `relabel_configs` from %q: %w", path, err)

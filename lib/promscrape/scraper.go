@@ -5,11 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/consul"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -21,9 +23,12 @@ var (
 	kubernetesSDCheckInterval = flag.Duration("promscrape.kubernetesSDCheckInterval", 30*time.Second, "Interval for checking for changes in Kubernetes API server. "+
 		"This works only if `kubernetes_sd_configs` is configured in '-promscrape.config' file. "+
 		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#kubernetes_sd_config for details")
-	consulSDCheckInterval = flag.Duration("promscrape.consulSDCheckInterval", 30*time.Second, "Interval for checking for changes in consul. "+
-		"This works only if `consul_sd_configs` is configured in '-promscrape.config' file. "+
-		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#consul_sd_config for details")
+	openstackSDCheckInterval = flag.Duration("promscrape.openstackSDCheckInterval", 30*time.Second, "Interval for checking for changes in openstack API server. "+
+		"This works only if `openstack_sd_configs` is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#openstack_sd_config for details")
+	eurekaSDCheckInterval = flag.Duration("promscrape.eurekaSDCheckInterval", 30*time.Second, "Interval for checking for changes in eureka. "+
+		"This works only if `eureka_sd_configs` is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#eureka_sd_config for details")
 	dnsSDCheckInterval = flag.Duration("promscrape.dnsSDCheckInterval", 30*time.Second, "Interval for checking for changes in dns. "+
 		"This works only if `dns_sd_configs` is configured in '-promscrape.config' file. "+
 		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dns_sd_config for details")
@@ -33,8 +38,13 @@ var (
 	gceSDCheckInterval = flag.Duration("promscrape.gceSDCheckInterval", time.Minute, "Interval for checking for changes in gce. "+
 		"This works only if `gce_sd_configs` is configured in '-promscrape.config' file. "+
 		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#gce_sd_config for details")
+	dockerswarmSDCheckInterval = flag.Duration("promscrape.dockerswarmSDCheckInterval", 30*time.Second, "Interval for checking for changes in dockerswarm. "+
+		"This works only if `dockerswarm_sd_configs` is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dockerswarm_sd_config for details")
 	promscrapeConfigFile = flag.String("promscrape.config", "", "Optional path to Prometheus config file with 'scrape_configs' section containing targets to scrape. "+
-		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#scrape_config for details")
+		"See https://victoriametrics.github.io/#how-to-scrape-prometheus-exporters-such-as-node-exporter for details")
+	suppressDuplicateScrapeTargetErrors = flag.Bool("promscrape.suppressDuplicateScrapeTargetErrors", false, "Whether to suppress `duplicate scrape target` errors; "+
+		"see https://victoriametrics.github.io/vmagent.html#troubleshooting for details")
 )
 
 // CheckConfig checks -promscrape.config for errors and unsupported options.
@@ -67,6 +77,9 @@ func Stop() {
 var (
 	globalStopCh chan struct{}
 	scraperWG    sync.WaitGroup
+	// PendingScrapeConfigs - zero value means, that
+	// all scrapeConfigs are inited and ready for work.
+	PendingScrapeConfigs int32
 )
 
 func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest), globalStopCh <-chan struct{}) {
@@ -82,13 +95,16 @@ func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest)
 	}
 
 	scs := newScrapeConfigs(pushData)
-	scs.add("static_configs", 0, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getStaticScrapeWork() })
-	scs.add("file_sd_configs", *fileSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getFileSDScrapeWork(swsPrev) })
-	scs.add("kubernetes_sd_configs", *kubernetesSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getKubernetesSDScrapeWork(swsPrev) })
-	scs.add("consul_sd_configs", *consulSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getConsulSDScrapeWork(swsPrev) })
-	scs.add("dns_sd_configs", *dnsSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getDNSSDScrapeWork(swsPrev) })
-	scs.add("ec2_sd_configs", *ec2SDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getEC2SDScrapeWork(swsPrev) })
-	scs.add("gce_sd_configs", *gceSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getGCESDScrapeWork(swsPrev) })
+	scs.add("static_configs", 0, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getStaticScrapeWork() })
+	scs.add("file_sd_configs", *fileSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getFileSDScrapeWork(swsPrev) })
+	scs.add("kubernetes_sd_configs", *kubernetesSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getKubernetesSDScrapeWork(swsPrev) })
+	scs.add("openstack_sd_configs", *openstackSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getOpenStackSDScrapeWork(swsPrev) })
+	scs.add("consul_sd_configs", *consul.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getConsulSDScrapeWork(swsPrev) })
+	scs.add("eureka_sd_configs", *eurekaSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getEurekaSDScrapeWork(swsPrev) })
+	scs.add("dns_sd_configs", *dnsSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getDNSSDScrapeWork(swsPrev) })
+	scs.add("ec2_sd_configs", *ec2SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getEC2SDScrapeWork(swsPrev) })
+	scs.add("gce_sd_configs", *gceSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getGCESDScrapeWork(swsPrev) })
+	scs.add("dockerswarm_sd_configs", *dockerswarmSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getDockerSwarmSDScrapeWork(swsPrev) })
 
 	sighupCh := procutil.NewSighupChan()
 
@@ -155,7 +171,8 @@ func newScrapeConfigs(pushData func(wr *prompbmarshal.WriteRequest)) *scrapeConf
 	}
 }
 
-func (scs *scrapeConfigs) add(name string, checkInterval time.Duration, getScrapeWork func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork) {
+func (scs *scrapeConfigs) add(name string, checkInterval time.Duration, getScrapeWork func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork) {
+	atomic.AddInt32(&PendingScrapeConfigs, 1)
 	scfg := &scrapeConfig{
 		name:          name,
 		pushData:      scs.pushData,
@@ -187,7 +204,7 @@ func (scs *scrapeConfigs) stop() {
 type scrapeConfig struct {
 	name          string
 	pushData      func(wr *prompbmarshal.WriteRequest)
-	getScrapeWork func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork
+	getScrapeWork func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork
 	checkInterval time.Duration
 	cfgCh         chan *Config
 	stopCh        <-chan struct{}
@@ -205,11 +222,16 @@ func (scfg *scrapeConfig) run() {
 	}
 
 	cfg := <-scfg.cfgCh
-	var swsPrev []ScrapeWork
-	for {
+	var swsPrev []*ScrapeWork
+	updateScrapeWork := func(cfg *Config) {
 		sws := scfg.getScrapeWork(cfg, swsPrev)
 		sg.update(sws)
 		swsPrev = sws
+	}
+	updateScrapeWork(cfg)
+	atomic.AddInt32(&PendingScrapeConfigs, -1)
+
+	for {
 
 		select {
 		case <-scfg.stopCh:
@@ -217,24 +239,33 @@ func (scfg *scrapeConfig) run() {
 		case cfg = <-scfg.cfgCh:
 		case <-tickerCh:
 		}
+		updateScrapeWork(cfg)
 	}
 }
 
 type scraperGroup struct {
-	name         string
-	wg           sync.WaitGroup
-	mLock        sync.Mutex
-	m            map[string]*scraper
-	pushData     func(wr *prompbmarshal.WriteRequest)
-	changesCount *metrics.Counter
+	name     string
+	wg       sync.WaitGroup
+	mLock    sync.Mutex
+	m        map[string]*scraper
+	pushData func(wr *prompbmarshal.WriteRequest)
+
+	changesCount    *metrics.Counter
+	activeScrapers  *metrics.Counter
+	scrapersStarted *metrics.Counter
+	scrapersStopped *metrics.Counter
 }
 
 func newScraperGroup(name string, pushData func(wr *prompbmarshal.WriteRequest)) *scraperGroup {
 	sg := &scraperGroup{
-		name:         name,
-		m:            make(map[string]*scraper),
-		pushData:     pushData,
-		changesCount: metrics.NewCounter(fmt.Sprintf(`vm_promscrape_config_changes_total{type=%q}`, name)),
+		name:     name,
+		m:        make(map[string]*scraper),
+		pushData: pushData,
+
+		changesCount:    metrics.NewCounter(fmt.Sprintf(`vm_promscrape_config_changes_total{type=%q}`, name)),
+		activeScrapers:  metrics.NewCounter(fmt.Sprintf(`vm_promscrape_active_scrapers{type=%q}`, name)),
+		scrapersStarted: metrics.NewCounter(fmt.Sprintf(`vm_promscrape_scrapers_started_total{type=%q}`, name)),
+		scrapersStopped: metrics.NewCounter(fmt.Sprintf(`vm_promscrape_scrapers_stopped_total{type=%q}`, name)),
 	}
 	metrics.NewGauge(fmt.Sprintf(`vm_promscrape_targets{type=%q, status="up"}`, name), func() float64 {
 		return float64(tsmGlobal.StatusByGroup(sg.name, true))
@@ -255,22 +286,28 @@ func (sg *scraperGroup) stop() {
 	sg.wg.Wait()
 }
 
-func (sg *scraperGroup) update(sws []ScrapeWork) {
+func (sg *scraperGroup) update(sws []*ScrapeWork) {
 	sg.mLock.Lock()
 	defer sg.mLock.Unlock()
 
 	additionsCount := 0
 	deletionsCount := 0
-	swsMap := make(map[string]bool, len(sws))
-	for i := range sws {
-		sw := &sws[i]
+	swsMap := make(map[string][]prompbmarshal.Label, len(sws))
+	for _, sw := range sws {
 		key := sw.key()
-		if swsMap[key] {
-			logger.Errorf("skipping duplicate scrape target with identical labels; endpoint=%s, labels=%s; make sure service discovery and relabeling is set up properly",
-				sw.ScrapeURL, sw.LabelsString())
+		originalLabels := swsMap[key]
+		if originalLabels != nil {
+			if !*suppressDuplicateScrapeTargetErrors {
+				logger.Errorf("skipping duplicate scrape target with identical labels; endpoint=%s, labels=%s; "+
+					"make sure service discovery and relabeling is set up properly; "+
+					"see also https://victoriametrics.github.io/vmagent.html#troubleshooting; "+
+					"original labels for target1: %s; original labels for target2: %s",
+					sw.ScrapeURL, sw.LabelsString(), promLabelsString(originalLabels), promLabelsString(sw.OriginalLabels))
+			}
+			droppedTargetsMap.Register(sw.OriginalLabels)
 			continue
 		}
-		swsMap[key] = true
+		swsMap[key] = sw.OriginalLabels
 		if sg.m[key] != nil {
 			// The scraper for the given key already exists.
 			continue
@@ -278,20 +315,24 @@ func (sg *scraperGroup) update(sws []ScrapeWork) {
 
 		// Start a scraper for the missing key.
 		sc := newScraper(sw, sg.name, sg.pushData)
+		sg.activeScrapers.Inc()
+		sg.scrapersStarted.Inc()
 		sg.wg.Add(1)
-		go func() {
+		tsmGlobal.Register(sw)
+		go func(sw *ScrapeWork) {
 			defer sg.wg.Done()
 			sc.sw.run(sc.stopCh)
 			tsmGlobal.Unregister(sw)
-		}()
-		tsmGlobal.Register(sw)
+			sg.activeScrapers.Dec()
+			sg.scrapersStopped.Inc()
+		}(sw)
 		sg.m[key] = sc
 		additionsCount++
 	}
 
 	// Stop deleted scrapers, which are missing in sws.
 	for key, sc := range sg.m {
-		if !swsMap[key] {
+		if _, ok := swsMap[key]; !ok {
 			close(sc.stopCh)
 			delete(sg.m, key)
 			deletionsCount++
@@ -314,9 +355,10 @@ func newScraper(sw *ScrapeWork, group string, pushData func(wr *prompbmarshal.Wr
 		stopCh: make(chan struct{}),
 	}
 	c := newClient(sw)
-	sc.sw.Config = *sw
+	sc.sw.Config = sw
 	sc.sw.ScrapeGroup = group
 	sc.sw.ReadData = c.ReadData
+	sc.sw.GetStreamReader = c.GetStreamReader
 	sc.sw.PushData = pushData
 	return sc
 }

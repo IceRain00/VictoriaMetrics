@@ -1,29 +1,31 @@
 package opentsdbhttp
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
-	"runtime"
 	"sync"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
-	maxInsertRequestSize = flag.Int("opentsdbhttp.maxInsertRequestSize", 32*1024*1024, "The maximum size of OpenTSDB HTTP put request")
+	maxInsertRequestSize = flagutil.NewBytes("opentsdbhttp.maxInsertRequestSize", 32*1024*1024, "The maximum size of OpenTSDB HTTP put request")
 	trimTimestamp        = flag.Duration("opentsdbhttpTrimTimestamp", time.Millisecond, "Trim timestamps for OpenTSDB HTTP data to this duration. "+
 		"Minimum practical duration is 1ms. Higher duration (i.e. 1s) may be used for reducing disk space usage for timestamp data")
 )
 
 // ParseStream parses OpenTSDB http lines from req and calls callback for the parsed rows.
 //
-// The callback can be called multiple times for streamed data from req.
+// The callback can be called concurrently multiple times for streamed data from req.
 //
 // callback shouldn't hold rows after returning.
 func ParseStream(req *http.Request, callback func(rows []Row) error) error {
@@ -39,33 +41,35 @@ func ParseStream(req *http.Request, callback func(rows []Row) error) error {
 		r = zr
 	}
 
-	ctx := getStreamContext()
+	ctx := getStreamContext(r)
 	defer putStreamContext(ctx)
 
 	// Read the request in ctx.reqBuf
-	lr := io.LimitReader(r, int64(*maxInsertRequestSize)+1)
+	lr := io.LimitReader(ctx.br, int64(maxInsertRequestSize.N)+1)
 	reqLen, err := ctx.reqBuf.ReadFrom(lr)
 	if err != nil {
 		readErrors.Inc()
 		return fmt.Errorf("cannot read HTTP OpenTSDB request: %w", err)
 	}
-	if reqLen > int64(*maxInsertRequestSize) {
+	if reqLen > int64(maxInsertRequestSize.N) {
 		readErrors.Inc()
-		return fmt.Errorf("too big HTTP OpenTSDB request; mustn't exceed `-opentsdbhttp.maxInsertRequestSize=%d` bytes", *maxInsertRequestSize)
+		return fmt.Errorf("too big HTTP OpenTSDB request; mustn't exceed `-opentsdbhttp.maxInsertRequestSize=%d` bytes", maxInsertRequestSize.N)
 	}
 
-	// Unmarshal the request to ctx.Rows
-	p := GetParser()
-	defer PutParser(p)
+	// Process the request synchronously, since there is no sense in processing a single request asynchronously.
+	// Sync code is easier to read and understand.
+	p := getJSONParser()
+	defer putJSONParser(p)
 	v, err := p.ParseBytes(ctx.reqBuf.B)
 	if err != nil {
 		unmarshalErrors.Inc()
 		return fmt.Errorf("cannot parse HTTP OpenTSDB json: %w", err)
 	}
-	ctx.Rows.Unmarshal(v)
-	rowsRead.Add(len(ctx.Rows.Rows))
-
-	rows := ctx.Rows.Rows
+	rs := getRows()
+	defer putRows(rs)
+	rs.Unmarshal(v)
+	rows := rs.Rows
+	rowsRead.Add(len(rows))
 
 	// Fill in missing timestamps
 	currentTimestamp := int64(fasttime.UnixTimestamp())
@@ -93,19 +97,21 @@ func ParseStream(req *http.Request, callback func(rows []Row) error) error {
 		}
 	}
 
-	// Insert ctx.Rows to db.
-	return callback(rows)
+	if err := callback(rows); err != nil {
+		return fmt.Errorf("error when processing imported data: %w", err)
+	}
+	return nil
 }
 
 const secondMask int64 = 0x7FFFFFFF00000000
 
 type streamContext struct {
-	Rows   Rows
+	br     *bufio.Reader
 	reqBuf bytesutil.ByteBuffer
 }
 
 func (ctx *streamContext) reset() {
-	ctx.Rows.Reset()
+	ctx.br.Reset(nil)
 	ctx.reqBuf.Reset()
 }
 
@@ -116,15 +122,20 @@ var (
 	unmarshalErrors = metrics.NewCounter(`vm_protoparser_unmarshal_errors_total{type="opentsdbhttp"}`)
 )
 
-func getStreamContext() *streamContext {
+func getStreamContext(r io.Reader) *streamContext {
 	select {
 	case ctx := <-streamContextPoolCh:
+		ctx.br.Reset(r)
 		return ctx
 	default:
 		if v := streamContextPool.Get(); v != nil {
-			return v.(*streamContext)
+			ctx := v.(*streamContext)
+			ctx.br.Reset(r)
+			return ctx
 		}
-		return &streamContext{}
+		return &streamContext{
+			br: bufio.NewReaderSize(r, 64*1024),
+		}
 	}
 }
 
@@ -138,4 +149,19 @@ func putStreamContext(ctx *streamContext) {
 }
 
 var streamContextPool sync.Pool
-var streamContextPoolCh = make(chan *streamContext, runtime.GOMAXPROCS(-1))
+var streamContextPoolCh = make(chan *streamContext, cgroup.AvailableCPUs())
+
+func getRows() *Rows {
+	v := rowsPool.Get()
+	if v == nil {
+		return &Rows{}
+	}
+	return v.(*Rows)
+}
+
+func putRows(rs *Rows) {
+	rs.Reset()
+	rowsPool.Put(rs)
+}
+
+var rowsPool sync.Pool

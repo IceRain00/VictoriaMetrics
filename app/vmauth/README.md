@@ -46,7 +46,7 @@ users:
   url_prefix: "http://localhost:8428"
 
   # The user for querying account 123 in VictoriaMetrics cluster
-  # See https://github.com/VictoriaMetrics/VictoriaMetrics/blob/cluster/README.md#url-format
+  # See https://victoriametrics.github.io/Cluster-VictoriaMetrics.html#url-format
   # All the requests to http://vmauth:8427 with the given Basic Auth (username:password)
   # will be routed to http://vmselect:8481/select/123/prometheus .
   # For example, http://vmauth:8427/api/v1/query is routed to http://vmselect:8481/select/123/prometheus/api/v1/select
@@ -55,7 +55,7 @@ users:
   url_prefix: "http://vmselect:8481/select/123/prometheus"
 
   # The user for inserting Prometheus data into VictoriaMetrics cluster under account 42
-  # See https://github.com/VictoriaMetrics/VictoriaMetrics/blob/cluster/README.md#url-format
+  # See https://victoriametrics.github.io/Cluster-VictoriaMetrics.html#url-format
   # All the reuqests to http://vmauth:8427 with the given Basic Auth (username:password)
   # will be routed to http://vminsert:8480/insert/42/prometheus .
   # For example, http://vmauth:8427/api/v1/write is routed to http://vminsert:8480/insert/42/prometheus/api/v1/write
@@ -63,6 +63,9 @@ users:
   password: "***"
   url_prefix: "http://vminsert:8480/insert/42/prometheus"
 ```
+
+The config may contain `%{ENV_VAR}` placeholders, which are substituted by the corresponding `ENV_VAR` environment variable values.
+This may be useful for passing secrets to the config.
 
 
 ### Security
@@ -84,7 +87,7 @@ Alternatively, [https termination proxy](https://en.wikipedia.org/wiki/TLS_termi
 ### Monitoring
 
 `vmauth` exports various metrics in Prometheus exposition format at `http://vmauth-host:8427/metrics` page. It is recommended setting up regular scraping of this page
-either via [vmagent](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/app/vmagent/README.md) or via Prometheus, so the exported metrics could be analyzed later.
+either via [vmagent](https://victoriametrics.github.io/vmagent.html) or via Prometheus, so the exported metrics could be analyzed later.
 
 
 ### How to build from sources
@@ -110,7 +113,7 @@ Run `make package-vmauth`. It builds `victoriametrics/vmauth:<PKG_TAG>` docker i
 `<PKG_TAG>` is auto-generated image tag, which depends on source code in the repository.
 The `<PKG_TAG>` may be manually set via `PKG_TAG=foobar make package-vmauth`.
 
-By default the image is built on top of [alpine](https://hub.docker.com/_/alpine) image. It is possible to build the package on top of any other base image
+The base docker image is [alpine](https://hub.docker.com/_/alpine) but it is possible to use any other base image
 by setting it via `<ROOT_IMAGE>` environment variable. For example, the following command builds the image on top of [scratch](https://hub.docker.com/_/scratch) image:
 
 ```bash
@@ -137,3 +140,68 @@ curl -s http://<vmauth-host>:8427/debug/pprof/profile > cpu.pprof
 The command for collecting CPU profile waits for 30 seconds before returning.
 
 The collected profiles may be analyzed with [go tool pprof](https://github.com/google/pprof).
+
+
+### Advanced usage
+
+Pass `-help` command-line arg to `vmauth` in order to see all the configuration options:
+
+```
+./vmauth -help
+
+vmauth authenticates and authorizes incoming requests and proxies them to VictoriaMetrics.
+
+See the docs at https://victoriametrics.github.io/vmauth.html .
+
+  -auth.config string
+    	Path to auth config. See https://victoriametrics.github.io/vmauth.html for details on the format of this auth config
+  -enableTCP6
+    	Whether to enable IPv6 for listening and dialing. By default only IPv4 TCP is used
+  -envflag.enable
+    	Whether to enable reading flags from environment variables additionally to command line. Command line flag values have priority over values from environment vars. Flags are read only from command line if this flag isn't set
+  -envflag.prefix string
+    	Prefix for environment variables if -envflag.enable is set
+  -http.connTimeout duration
+    	Incoming http connections are closed after the configured timeout. This may help spreading incoming load among a cluster of services behind load balancer. Note that the real timeout may be bigger by up to 10% as a protection from Thundering herd problem (default 2m0s)
+  -http.disableResponseCompression
+    	Disable compression of HTTP responses for saving CPU resources. By default compression is enabled to save network bandwidth
+  -http.idleConnTimeout duration
+    	Timeout for incoming idle http connections (default 1m0s)
+  -http.maxGracefulShutdownDuration duration
+    	The maximum duration for graceful shutdown of HTTP server. Highly loaded server may require increased value for graceful shutdown (default 7s)
+  -http.pathPrefix string
+    	An optional prefix to add to all the paths handled by http server. For example, if '-http.pathPrefix=/foo/bar' is set, then all the http requests will be handled on '/foo/bar/*' paths. This may be useful for proxied requests. See https://www.robustperception.io/using-external-urls-and-proxies-with-prometheus
+  -http.shutdownDelay duration
+    	Optional delay before http server shutdown. During this dealy the servier returns non-OK responses from /health page, so load balancers can route new requests to other servers
+  -httpAuth.password string
+    	Password for HTTP Basic Auth. The authentication is disabled if -httpAuth.username is empty
+  -httpAuth.username string
+    	Username for HTTP Basic Auth. The authentication is disabled if empty. See also -httpAuth.password
+  -httpListenAddr string
+    	TCP address to listen for http connections (default ":8427")
+  -loggerErrorsPerSecondLimit int
+    	Per-second limit on the number of ERROR messages. If more than the given number of errors are emitted per second, then the remaining errors are suppressed. Zero value disables the rate limit (default 10)
+  -loggerFormat string
+    	Format for logs. Possible values: default, json (default "default")
+  -loggerLevel string
+    	Minimum level of errors to log. Possible values: INFO, WARN, ERROR, FATAL, PANIC (default "INFO")
+  -loggerOutput string
+    	Output for the logs. Supported values: stderr, stdout (default "stderr")
+  -memory.allowedBytes value
+    	Allowed size of system memory VictoriaMetrics caches may occupy. This option overrides -memory.allowedPercent if set to non-zero value. Too low value may increase cache miss rate, which usually results in higher CPU and disk IO usage. Too high value may evict too much data from OS page cache, which will result in higher disk IO usage
+    	Supports the following optional suffixes for values: KB, MB, GB, KiB, MiB, GiB (default 0)
+  -memory.allowedPercent float
+    	Allowed percent of system memory VictoriaMetrics caches may occupy. See also -memory.allowedBytes. Too low value may increase cache miss rate, which usually results in higher CPU and disk IO usage. Too high value may evict too much data from OS page cache, which will result in higher disk IO usage (default 60)
+  -metricsAuthKey string
+    	Auth key for /metrics. It overrides httpAuth settings
+  -pprofAuthKey string
+    	Auth key for /debug/pprof. It overrides httpAuth settings
+  -tls
+    	Whether to enable TLS (aka HTTPS) for incoming requests. -tlsCertFile and -tlsKeyFile must be set if -tls is set
+  -tlsCertFile string
+    	Path to file with TLS certificate. Used only if -tls is set. Prefer ECDSA certs instead of RSA certs, since RSA certs are slow
+  -tlsKeyFile string
+    	Path to file with TLS key. Used only if -tls is set
+  -version
+    	Show VictoriaMetrics version
+```

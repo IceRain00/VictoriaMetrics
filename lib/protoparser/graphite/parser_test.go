@@ -7,6 +7,57 @@ import (
 	"testing"
 )
 
+func TestUnmarshalMetricAndTagsFailure(t *testing.T) {
+	f := func(s string) {
+		t.Helper()
+		var r Row
+		_, err := r.UnmarshalMetricAndTags(s, nil)
+		if err == nil {
+			t.Fatalf("expecting non-nil error for UnmarshalMetricAndTags(%q)", s)
+		}
+	}
+	f("")
+	f(";foo=bar")
+	f(" ")
+	f("foo;bar")
+	f("foo ;bar=baz")
+	f("f oo;bar=baz")
+	f("foo;bar=baz   ")
+	f("foo;bar= baz")
+	f("foo;bar=b az")
+	f("foo;b ar=baz")
+}
+
+func TestUnmarshalMetricAndTagsSuccess(t *testing.T) {
+	f := func(s string, rExpected *Row) {
+		t.Helper()
+		var r Row
+		_, err := r.UnmarshalMetricAndTags(s, nil)
+		if err != nil {
+			t.Fatalf("unexpected error in UnmarshalMetricAndTags(%q): %s", s, err)
+		}
+		if !reflect.DeepEqual(&r, rExpected) {
+			t.Fatalf("unexpected row;\ngot\n%+v\nwant\n%+v", &r, rExpected)
+		}
+	}
+	f("foo", &Row{
+		Metric: "foo",
+	})
+	f("foo;bar=123;baz=aabb", &Row{
+		Metric: "foo",
+		Tags: []Tag{
+			{
+				Key:   "bar",
+				Value: "123",
+			},
+			{
+				Key:   "baz",
+				Value: "aabb",
+			},
+		},
+	})
+}
+
 func TestRowsUnmarshalFailure(t *testing.T) {
 	f := func(s string) {
 		t.Helper()
@@ -34,6 +85,16 @@ func TestRowsUnmarshalFailure(t *testing.T) {
 
 	// missing tag value
 	f("aa;bb 23 34")
+
+	// unexpected space in tag value
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/99
+	f("s;tag1=aaa1;tag2=bb b2;tag3=ccc3 1")
+
+	// invalid value
+	f("aa bb")
+
+	// invalid timestamp
+	f("aa 123 bar")
 }
 
 func TestRowsUnmarshalSuccess(t *testing.T) {
@@ -100,6 +161,16 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 			Metric:    "aaa",
 			Value:     1123,
 			Timestamp: 429496729600,
+		}},
+	})
+
+	// Floating-point timestamp
+	// See https://github.com/graphite-project/carbon/blob/b0ba62a62d40a37950fed47a8f6ae6d0f02e6af5/lib/carbon/protocols.py#L197
+	f("aaa 1123 4294.943", &Rows{
+		Rows: []Row{{
+			Metric:    "aaa",
+			Value:     1123,
+			Timestamp: 4294,
 		}},
 	})
 
@@ -174,13 +245,25 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 func Test_streamContext_Read(t *testing.T) {
 	f := func(s string, rowsExpected *Rows) {
 		t.Helper()
-		ctx := &streamContext{}
-		ctx.Read(strings.NewReader(s))
-		if len(ctx.Rows.Rows) != len(rowsExpected.Rows) {
-			t.Fatalf("different len of expected rows;\ngot\n%+v;\nwant\n%+v", ctx.Rows, rowsExpected.Rows)
+		ctx := getStreamContext(strings.NewReader(s))
+		if !ctx.Read() {
+			t.Fatalf("expecting successful read")
 		}
-		if !reflect.DeepEqual(ctx.Rows.Rows, rowsExpected.Rows) {
-			t.Fatalf("unexpected rows;\ngot\n%+v;\nwant\n%+v", ctx.Rows.Rows, rowsExpected.Rows)
+		uw := getUnmarshalWork()
+		callbackCalls := 0
+		uw.callback = func(rows []Row) {
+			callbackCalls++
+			if len(rows) != len(rowsExpected.Rows) {
+				t.Fatalf("different len of expected rows;\ngot\n%+v;\nwant\n%+v", rows, rowsExpected.Rows)
+			}
+			if !reflect.DeepEqual(rows, rowsExpected.Rows) {
+				t.Fatalf("unexpected rows;\ngot\n%+v;\nwant\n%+v", rows, rowsExpected.Rows)
+			}
+		}
+		uw.reqBuf = append(uw.reqBuf[:0], ctx.reqBuf...)
+		uw.Unmarshal()
+		if callbackCalls != 1 {
+			t.Fatalf("unexpected number of callback calls; got %d; want 1", callbackCalls)
 		}
 	}
 

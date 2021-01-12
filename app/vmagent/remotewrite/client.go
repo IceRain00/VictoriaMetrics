@@ -1,10 +1,13 @@
 package remotewrite
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
-	"flag"
 	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -13,14 +16,15 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/persistentqueue"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
-	"github.com/VictoriaMetrics/fasthttp"
 	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
-	sendTimeout = flag.Duration("remoteWrite.sendTimeout", time.Minute, "Timeout for sending a single block of data to -remoteWrite.url")
+	sendTimeout = flagutil.NewArrayDuration("remoteWrite.sendTimeout", "Timeout for sending a single block of data to -remoteWrite.url")
+	proxyURL    = flagutil.NewArray("remoteWrite.proxyURL", "Optional proxy URL for writing data to -remoteWrite.url. Supported proxies: http, https, socks5. "+
+		"Example: -remoteWrite.proxyURL=socks5://proxy:1234")
 
-	tlsInsecureSkipVerify = flag.Bool("remoteWrite.tlsInsecureSkipVerify", false, "Whether to skip tls verification when connecting to -remoteWrite.url")
+	tlsInsecureSkipVerify = flagutil.NewArrayBool("remoteWrite.tlsInsecureSkipVerify", "Whether to skip tls verification when connecting to -remoteWrite.url")
 	tlsCertFile           = flagutil.NewArray("remoteWrite.tlsCertFile", "Optional path to client-side TLS certificate file to use when connecting to -remoteWrite.url. "+
 		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
 	tlsKeyFile = flagutil.NewArray("remoteWrite.tlsKeyFile", "Optional path to client-side TLS certificate key to use when connecting to -remoteWrite.url. "+
@@ -39,24 +43,49 @@ var (
 )
 
 type client struct {
-	urlLabelValue  string
+	sanitizedURL   string
 	remoteWriteURL string
-	host           string
-	requestURI     string
 	authHeader     string
 	fq             *persistentqueue.FastQueue
-	hc             *fasthttp.HostClient
+	hc             *http.Client
 
+	bytesSent       *metrics.Counter
+	blocksSent      *metrics.Counter
 	requestDuration *metrics.Histogram
 	requestsOKCount *metrics.Counter
 	errorsCount     *metrics.Counter
+	packetsDropped  *metrics.Counter
 	retriesCount    *metrics.Counter
 
 	wg     sync.WaitGroup
 	stopCh chan struct{}
 }
 
-func newClient(argIdx int, remoteWriteURL, urlLabelValue string, fq *persistentqueue.FastQueue, concurrency int) *client {
+func newClient(argIdx int, remoteWriteURL, sanitizedURL string, fq *persistentqueue.FastQueue, concurrency int) *client {
+	tlsCfg, err := getTLSConfig(argIdx)
+	if err != nil {
+		logger.Panicf("FATAL: cannot initialize TLS config: %s", err)
+	}
+	tr := &http.Transport{
+		Dial:                statDial,
+		TLSClientConfig:     tlsCfg,
+		TLSHandshakeTimeout: 5 * time.Second,
+		MaxConnsPerHost:     2 * concurrency,
+		MaxIdleConnsPerHost: 2 * concurrency,
+		IdleConnTimeout:     time.Minute,
+		WriteBufferSize:     64 * 1024,
+	}
+	pURL := proxyURL.GetOptionalArg(argIdx)
+	if len(pURL) > 0 {
+		if !strings.Contains(pURL, "://") {
+			logger.Fatalf("cannot parse -remoteWrite.proxyURL=%q: it must start with `http://`, `https://` or `socks5://`", pURL)
+		}
+		urlProxy, err := url.Parse(pURL)
+		if err != nil {
+			logger.Fatalf("cannot parse -remoteWrite.proxyURL=%q: %s", pURL, err)
+		}
+		tr.Proxy = http.ProxyURL(urlProxy)
+	}
 	authHeader := ""
 	username := basicAuthUsername.GetOptionalArg(argIdx)
 	password := basicAuthPassword.GetOptionalArg(argIdx)
@@ -73,68 +102,24 @@ func newClient(argIdx int, remoteWriteURL, urlLabelValue string, fq *persistentq
 		}
 		authHeader = "Bearer " + token
 	}
-
-	readTimeout := *sendTimeout
-	if readTimeout <= 0 {
-		readTimeout = time.Minute
-	}
-	writeTimeout := readTimeout
-	var u fasthttp.URI
-	u.Update(remoteWriteURL)
-	scheme := string(u.Scheme())
-	switch scheme {
-	case "http", "https":
-	default:
-		logger.Fatalf("unsupported scheme in -remoteWrite.url=%q: %q. It must be http or https", remoteWriteURL, scheme)
-	}
-	host := string(u.Host())
-	if len(host) == 0 {
-		logger.Fatalf("invalid -remoteWrite.url=%q: host cannot be empty. Make sure the url looks like `http://host:port/path`", remoteWriteURL)
-	}
-	requestURI := string(u.RequestURI())
-	isTLS := scheme == "https"
-	var tlsCfg *tls.Config
-	if isTLS {
-		var err error
-		tlsCfg, err = getTLSConfig(argIdx)
-		if err != nil {
-			logger.Panicf("FATAL: cannot initialize TLS config: %s", err)
-		}
-	}
-	if !strings.Contains(host, ":") {
-		if isTLS {
-			host += ":443"
-		} else {
-			host += ":80"
-		}
-	}
-	maxConns := 2 * concurrency
-	hc := &fasthttp.HostClient{
-		Addr:                host,
-		Name:                "vmagent",
-		Dial:                statDial,
-		IsTLS:               isTLS,
-		TLSConfig:           tlsCfg,
-		MaxConns:            maxConns,
-		MaxIdleConnDuration: 10 * readTimeout,
-		ReadTimeout:         readTimeout,
-		WriteTimeout:        writeTimeout,
-		MaxResponseBodySize: 1024 * 1024,
-	}
 	c := &client{
-		urlLabelValue:  urlLabelValue,
+		sanitizedURL:   sanitizedURL,
 		remoteWriteURL: remoteWriteURL,
-		host:           host,
-		requestURI:     requestURI,
 		authHeader:     authHeader,
 		fq:             fq,
-		hc:             hc,
-		stopCh:         make(chan struct{}),
+		hc: &http.Client{
+			Transport: tr,
+			Timeout:   sendTimeout.GetOptionalArgOrDefault(argIdx, time.Minute),
+		},
+		stopCh: make(chan struct{}),
 	}
-	c.requestDuration = metrics.GetOrCreateHistogram(fmt.Sprintf(`vmagent_remotewrite_duration_seconds{url=%q}`, c.urlLabelValue))
-	c.requestsOKCount = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_requests_total{url=%q, status_code="2XX"}`, c.urlLabelValue))
-	c.errorsCount = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_errors_total{url=%q}`, c.urlLabelValue))
-	c.retriesCount = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_retries_count_total{url=%q}`, c.urlLabelValue))
+	c.bytesSent = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_bytes_sent_total{url=%q}`, c.sanitizedURL))
+	c.blocksSent = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_blocks_sent_total{url=%q}`, c.sanitizedURL))
+	c.requestDuration = metrics.GetOrCreateHistogram(fmt.Sprintf(`vmagent_remotewrite_duration_seconds{url=%q}`, c.sanitizedURL))
+	c.requestsOKCount = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_requests_total{url=%q, status_code="2XX"}`, c.sanitizedURL))
+	c.errorsCount = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_errors_total{url=%q}`, c.sanitizedURL))
+	c.packetsDropped = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_packets_dropped_total{url=%q}`, c.sanitizedURL))
+	c.retriesCount = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_retries_count_total{url=%q}`, c.sanitizedURL))
 	for i := 0; i < concurrency; i++ {
 		c.wg.Add(1)
 		go func() {
@@ -142,25 +127,28 @@ func newClient(argIdx int, remoteWriteURL, urlLabelValue string, fq *persistentq
 			c.runWorker()
 		}()
 	}
-	logger.Infof("initialized client for -remoteWrite.url=%q", c.remoteWriteURL)
+	logger.Infof("initialized client for -remoteWrite.url=%q", c.sanitizedURL)
 	return c
 }
 
 func (c *client) MustStop() {
 	close(c.stopCh)
 	c.wg.Wait()
-	logger.Infof("stopped client for -remoteWrite.url=%q", c.remoteWriteURL)
+	logger.Infof("stopped client for -remoteWrite.url=%q", c.sanitizedURL)
 }
 
 func getTLSConfig(argIdx int) (*tls.Config, error) {
-	tlsConfig := &promauth.TLSConfig{
+	c := &promauth.TLSConfig{
 		CAFile:             tlsCAFile.GetOptionalArg(argIdx),
 		CertFile:           tlsCertFile.GetOptionalArg(argIdx),
 		KeyFile:            tlsKeyFile.GetOptionalArg(argIdx),
 		ServerName:         tlsServerName.GetOptionalArg(argIdx),
-		InsecureSkipVerify: *tlsInsecureSkipVerify,
+		InsecureSkipVerify: tlsInsecureSkipVerify.GetOptionalArg(argIdx),
 	}
-	cfg, err := promauth.NewConfig(".", nil, "", "", tlsConfig)
+	if c.CAFile == "" && c.CertFile == "" && c.KeyFile == "" && c.ServerName == "" && !c.InsecureSkipVerify {
+		return nil, nil
+	}
+	cfg, err := promauth.NewConfig(".", nil, "", "", c)
 	if err != nil {
 		return nil, fmt.Errorf("cannot populate TLS config: %w", err)
 	}
@@ -193,7 +181,7 @@ func (c *client) runWorker() {
 				// The block has been sent successfully.
 			case <-time.After(graceDuration):
 				logger.Errorf("couldn't sent block with size %d bytes to %q in %.3f seconds during shutdown; dropping it",
-					len(block), c.remoteWriteURL, graceDuration.Seconds())
+					len(block), c.sanitizedURL, graceDuration.Seconds())
 			}
 			return
 		}
@@ -201,32 +189,27 @@ func (c *client) runWorker() {
 }
 
 func (c *client) sendBlock(block []byte) {
-	req := fasthttp.AcquireRequest()
-	req.SetRequestURI(c.requestURI)
-	req.SetHost(c.host)
-	req.Header.SetMethod("POST")
-	req.Header.Add("Content-Type", "application/x-protobuf")
-	req.Header.Add("Content-Encoding", "snappy")
-	req.Header.Add("X-Prometheus-Remote-Write-Version", "0.1.0")
+	retryDuration := time.Second
+	retriesCount := 0
+	c.bytesSent.Add(len(block))
+	c.blocksSent.Inc()
+
+again:
+	req, err := http.NewRequest("POST", c.remoteWriteURL, bytes.NewBuffer(block))
+	if err != nil {
+		logger.Panicf("BUG: unexected error from http.NewRequest(%q): %s", c.sanitizedURL, err)
+	}
+	h := req.Header
+	h.Set("User-Agent", "vmagent")
+	h.Set("Content-Type", "application/x-protobuf")
+	h.Set("Content-Encoding", "snappy")
+	h.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
 	if c.authHeader != "" {
 		req.Header.Set("Authorization", c.authHeader)
 	}
-	req.SetBody(block)
-
-	retryDuration := time.Second
-	resp := fasthttp.AcquireResponse()
-
-again:
-	select {
-	case <-c.stopCh:
-		fasthttp.ReleaseRequest(req)
-		fasthttp.ReleaseResponse(resp)
-		return
-	default:
-	}
 
 	startTime := time.Now()
-	err := doRequestWithPossibleRetry(c.hc, req, resp)
+	resp, err := c.hc.Do(req)
 	c.requestDuration.UpdateDuration(startTime)
 	if err != nil {
 		c.errorsCount.Inc()
@@ -235,40 +218,56 @@ again:
 			retryDuration = time.Minute
 		}
 		logger.Errorf("couldn't send a block with size %d bytes to %q: %s; re-sending the block in %.3f seconds",
-			len(block), c.remoteWriteURL, err, retryDuration.Seconds())
-		time.Sleep(retryDuration)
-		c.retriesCount.Inc()
-		goto again
-	}
-	statusCode := resp.StatusCode()
-	if statusCode/100 != 2 {
-		metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_requests_total{url=%q, status_code="%d"}`, c.urlLabelValue, statusCode)).Inc()
-		retryDuration *= 2
-		if retryDuration > time.Minute {
-			retryDuration = time.Minute
+			len(block), c.sanitizedURL, err, retryDuration.Seconds())
+		t := time.NewTimer(retryDuration)
+		select {
+		case <-c.stopCh:
+			t.Stop()
+			return
+		case <-t.C:
 		}
-		logger.Errorf("unexpected status code received after sending a block with size %d bytes to %q: %d; response body=%q; re-sending the block in %.3f seconds",
-			len(block), c.remoteWriteURL, statusCode, resp.Body(), retryDuration.Seconds())
-		time.Sleep(retryDuration)
 		c.retriesCount.Inc()
 		goto again
 	}
-	c.requestsOKCount.Inc()
-
-	// The block has been successfully sent to the remote storage.
-	fasthttp.ReleaseResponse(resp)
-	fasthttp.ReleaseRequest(req)
-}
-
-func doRequestWithPossibleRetry(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response) error {
-	// There is no need in calling DoTimeout, since the timeout must be already set in hc.ReadTimeout.
-	err := hc.Do(req, resp)
-	if err == nil {
-		return nil
+	statusCode := resp.StatusCode
+	if statusCode/100 == 2 {
+		_ = resp.Body.Close()
+		c.requestsOKCount.Inc()
+		return
 	}
-	if err != fasthttp.ErrConnectionClosed {
-		return err
+	metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_requests_total{url=%q, status_code="%d"}`, c.sanitizedURL, statusCode)).Inc()
+	if statusCode == 409 {
+		// Just drop block on 409 status code like Prometheus does.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/873
+		body, _ := ioutil.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		logger.Errorf("unexpected status code received when sending a block with size %d bytes to %q: #%d; dropping the block like Prometheus does; "+
+			"response body=%q", len(block), c.sanitizedURL, statusCode, body)
+		c.packetsDropped.Inc()
+		return
 	}
-	// Retry request if the server closed the keep-alive connection during the first attempt.
-	return hc.Do(req, resp)
+
+	// Unexpected status code returned
+	retriesCount++
+	retryDuration *= 2
+	if retryDuration > time.Minute {
+		retryDuration = time.Minute
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		logger.Errorf("cannot read response body from %q during retry #%d: %s", c.sanitizedURL, retriesCount, err)
+	} else {
+		logger.Errorf("unexpected status code received after sending a block with size %d bytes to %q during retry #%d: %d; response body=%q; "+
+			"re-sending the block in %.3f seconds", len(block), c.sanitizedURL, retriesCount, statusCode, body, retryDuration.Seconds())
+	}
+	t := time.NewTimer(retryDuration)
+	select {
+	case <-c.stopCh:
+		t.Stop()
+		return
+	case <-t.C:
+	}
+	c.retriesCount.Inc()
+	goto again
 }

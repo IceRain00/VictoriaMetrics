@@ -4,11 +4,12 @@ import (
 	"flag"
 	"fmt"
 	"math"
-	"runtime"
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
@@ -17,6 +18,7 @@ import (
 )
 
 var (
+	disableCache           = flag.Bool("search.disableCache", false, "Whether to disable response caching. This may be useful during data backfilling")
 	maxPointsPerTimeseries = flag.Int("search.maxPointsPerTimeseries", 30e3, "The maximum points per a single timeseries returned from the search")
 )
 
@@ -42,6 +44,11 @@ func ValidateMaxPointsPerTimeseries(start, end, step int64) error {
 //
 // See EvalConfig.mayCache for details.
 func AdjustStartEnd(start, end, step int64) (int64, int64) {
+	if *disableCache {
+		// Do not adjust start and end values when cache is disabled.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/563
+		return start, end
+	}
 	points := (end-start)/step + 1
 	if points < minTimeseriesPointsForTimeRounding {
 		// Too small number of points for rounding.
@@ -50,14 +57,7 @@ func AdjustStartEnd(start, end, step int64) (int64, int64) {
 
 	// Round start and end to values divisible by step in order
 	// to enable response caching (see EvalConfig.mayCache).
-
-	// Round start to the nearest smaller value divisible by step.
-	start -= start % step
-	// Round end to the nearest bigger value divisible by step.
-	adjust := end % step
-	if adjust > 0 {
-		end += step - adjust
-	}
+	start, end = alignStartEnd(start, end, step)
 
 	// Make sure that the new number of points is the same as the initial number of points.
 	newPoints := (end-start)/step + 1
@@ -69,13 +69,27 @@ func AdjustStartEnd(start, end, step int64) (int64, int64) {
 	return start, end
 }
 
+func alignStartEnd(start, end, step int64) (int64, int64) {
+	// Round start to the nearest smaller value divisible by step.
+	start -= start % step
+	// Round end to the nearest bigger value divisible by step.
+	adjust := end % step
+	if adjust > 0 {
+		end += step - adjust
+	}
+	return start, end
+}
+
 // EvalConfig is the configuration required for query evaluation via Exec
 type EvalConfig struct {
 	Start int64
 	End   int64
 	Step  int64
 
-	Deadline netstorage.Deadline
+	// QuotedRemoteAddr contains quoted remote address.
+	QuotedRemoteAddr string
+
+	Deadline searchutils.Deadline
 
 	MayCache bool
 
@@ -110,6 +124,9 @@ func (ec *EvalConfig) validate() {
 }
 
 func (ec *EvalConfig) mayCache() bool {
+	if *disableCache {
+		return false
+	}
 	if !ec.MayCache {
 		return false
 	}
@@ -422,12 +439,10 @@ func evalRollupFunc(ec *EvalConfig, name string, rf rollupFunc, expr metricsql.E
 		ecNew = newEvalConfig(ecNew)
 		ecNew.Start -= offset
 		ecNew.End -= offset
-		if ecNew.MayCache {
-			start, end := AdjustStartEnd(ecNew.Start, ecNew.End, ecNew.Step)
-			offset += ecNew.Start - start
-			ecNew.Start = start
-			ecNew.End = end
-		}
+		// There is no need in calling AdjustStartEnd() on ecNew if ecNew.MayCache is set to true,
+		// since the time range alignment has been already performed by the caller,
+		// so cache hit rate should be quite good.
+		// See also https://github.com/VictoriaMetrics/VictoriaMetrics/issues/976
 	}
 	if name == "rollup_candlestick" {
 		// Automatically apply `offset -step` to `rollup_candlestick` function
@@ -489,11 +504,13 @@ func evalRollupFuncWithSubquery(ec *EvalConfig, name string, rf rollupFunc, expr
 
 	ecSQ := newEvalConfig(ec)
 	ecSQ.Start -= window + maxSilenceInterval + step
+	ecSQ.End += step
 	ecSQ.Step = step
 	if err := ValidateMaxPointsPerTimeseries(ecSQ.Start, ecSQ.End, ecSQ.Step); err != nil {
 		return nil, err
 	}
-	ecSQ.Start, ecSQ.End = AdjustStartEnd(ecSQ.Start, ecSQ.End, ecSQ.Step)
+	// unconditionally align start and end args to step for subquery as Prometheus does.
+	ecSQ.Start, ecSQ.End = alignStartEnd(ecSQ.Start, ecSQ.End, ecSQ.Step)
 	tssSQ, err := evalExpr(ecSQ, re.Expr)
 	if err != nil {
 		return nil, err
@@ -505,7 +522,6 @@ func evalRollupFuncWithSubquery(ec *EvalConfig, name string, rf rollupFunc, expr
 		}
 		return nil, nil
 	}
-
 	sharedTimestamps := getTimestamps(ec.Start, ec.End, ec.Step)
 	preFunc, rcs, err := getRollupConfigs(name, rf, expr, ec.Start, ec.End, ec.Step, window, ec.LookbackDelta, sharedTimestamps)
 	if err != nil {
@@ -537,7 +553,7 @@ func evalRollupFuncWithSubquery(ec *EvalConfig, name string, rf rollupFunc, expr
 }
 
 func doParallel(tss []*timeseries, f func(ts *timeseries, values []float64, timestamps []int64) ([]float64, []int64)) {
-	concurrency := runtime.GOMAXPROCS(-1)
+	concurrency := cgroup.AvailableCPUs()
 	if concurrency > len(tss) {
 		concurrency = len(tss)
 	}
@@ -635,11 +651,7 @@ func evalRollupFuncWithMetricExpr(ec *EvalConfig, name string, rf rollupFunc,
 	} else {
 		minTimestamp -= ec.Step
 	}
-	sq := &storage.SearchQuery{
-		MinTimestamp: minTimestamp,
-		MaxTimestamp: ec.End,
-		TagFilterss:  [][]storage.TagFilter{tfs},
-	}
+	sq := storage.NewSearchQuery(minTimestamp, ec.End, [][]storage.TagFilter{tfs})
 	rss, err := netstorage.ProcessSearchQuery(sq, true, ec.Deadline)
 	if err != nil {
 		return nil, err
@@ -664,7 +676,7 @@ func evalRollupFuncWithMetricExpr(ec *EvalConfig, name string, rf rollupFunc,
 	timeseriesLen := rssLen
 	if iafc != nil {
 		// Incremental aggregates require holding only GOMAXPROCS timeseries in memory.
-		timeseriesLen = runtime.GOMAXPROCS(-1)
+		timeseriesLen = cgroup.AvailableCPUs()
 		if iafc.ae.Modifier.Op != "" {
 			if iafc.ae.Limit > 0 {
 				// There is an explicit limit on the number of output time series.
@@ -686,9 +698,10 @@ func evalRollupFuncWithMetricExpr(ec *EvalConfig, name string, rf rollupFunc,
 	if !rml.Get(uint64(rollupMemorySize)) {
 		rss.Cancel()
 		return nil, fmt.Errorf("not enough memory for processing %d data points across %d time series with %d points in each time series; "+
+			"total available memory for concurrent requests: %d bytes; "+
 			"possible solutions are: reducing the number of matching time series; switching to node with more RAM; "+
 			"increasing -memory.allowedPercent; increasing `step` query arg (%gs)",
-			rollupPoints, timeseriesLen*len(rcs), pointsPerTimeseries, float64(ec.Step)/1e3)
+			rollupPoints, timeseriesLen*len(rcs), pointsPerTimeseries, rml.MaxSize, float64(ec.Step)/1e3)
 	}
 	defer rml.Put(uint64(rollupMemorySize))
 
@@ -722,7 +735,7 @@ func getRollupMemoryLimiter() *memoryLimiter {
 
 func evalRollupWithIncrementalAggregate(name string, iafc *incrementalAggrFuncContext, rss *netstorage.Results, rcs []*rollupConfig,
 	preFunc func(values []float64, timestamps []int64), sharedTimestamps []int64, removeMetricGroup bool) ([]*timeseries, error) {
-	err := rss.RunParallel(func(rs *netstorage.Result, workerID uint) {
+	err := rss.RunParallel(func(rs *netstorage.Result, workerID uint) error {
 		preFunc(rs.Values, rs.Timestamps)
 		ts := getTimeseries()
 		defer putTimeseries(ts)
@@ -742,6 +755,7 @@ func evalRollupWithIncrementalAggregate(name string, iafc *incrementalAggrFuncCo
 			ts.Timestamps = nil
 			ts.denyReuse = false
 		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -754,7 +768,7 @@ func evalRollupNoIncrementalAggregate(name string, rss *netstorage.Results, rcs 
 	preFunc func(values []float64, timestamps []int64), sharedTimestamps []int64, removeMetricGroup bool) ([]*timeseries, error) {
 	tss := make([]*timeseries, 0, rss.Len()*len(rcs))
 	var tssLock sync.Mutex
-	err := rss.RunParallel(func(rs *netstorage.Result, workerID uint) {
+	err := rss.RunParallel(func(rs *netstorage.Result, workerID uint) error {
 		preFunc(rs.Values, rs.Timestamps)
 		for _, rc := range rcs {
 			if tsm := newTimeseriesMap(name, sharedTimestamps, &rs.MetricName); tsm != nil {
@@ -770,6 +784,7 @@ func evalRollupNoIncrementalAggregate(name string, rss *netstorage.Results, rcs 
 			tss = append(tss, &ts)
 			tssLock.Unlock()
 		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -817,7 +832,7 @@ func evalTime(ec *EvalConfig) []*timeseries {
 	timestamps := rv[0].Timestamps
 	values := rv[0].Values
 	for i, ts := range timestamps {
-		values[i] = float64(ts) * 1e-3
+		values[i] = float64(ts) / 1e3
 	}
 	return rv
 }

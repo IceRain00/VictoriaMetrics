@@ -1,10 +1,11 @@
 package common
 
 import (
-	"runtime"
 	"sync"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 )
 
 // PushCtx is a context used for populating WriteRequest.
@@ -28,12 +29,7 @@ func (ctx *PushCtx) Reset() {
 	}
 	ctx.WriteRequest.Timeseries = ctx.WriteRequest.Timeseries[:0]
 
-	labels := ctx.Labels
-	for i := range labels {
-		label := &labels[i]
-		label.Name = ""
-		label.Value = ""
-	}
+	promrelabel.CleanLabels(ctx.Labels)
 	ctx.Labels = ctx.Labels[:0]
 
 	ctx.Samples = ctx.Samples[:0]
@@ -67,4 +63,4 @@ func PutPushCtx(ctx *PushCtx) {
 }
 
 var pushCtxPool sync.Pool
-var pushCtxPoolCh = make(chan *PushCtx, runtime.GOMAXPROCS(-1))
+var pushCtxPoolCh = make(chan *PushCtx, cgroup.AvailableCPUs())

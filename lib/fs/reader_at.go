@@ -149,13 +149,22 @@ func (r *ReaderAt) MustClose() {
 	readersCount.Dec()
 }
 
-// OpenReaderAt opens ReaderAt for reading from filename.
+// MustFadviseSequentialRead hints the OS that f is read mostly sequentially.
+//
+// if prefetch is set, then the OS is hinted to prefetch f data.
+func (r *ReaderAt) MustFadviseSequentialRead(prefetch bool) {
+	if err := fadviseSequentialRead(r.f, prefetch); err != nil {
+		logger.Panicf("FATAL: error in fadviseSequentialRead(%q, %v): %s", r.f.Name(), prefetch, err)
+	}
+}
+
+// MustOpenReaderAt opens ReaderAt for reading from filename.
 //
 // MustClose must be called on the returned ReaderAt when it is no longer needed.
-func OpenReaderAt(path string) (*ReaderAt, error) {
+func MustOpenReaderAt(path string) *ReaderAt {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open file %q for reader: %w", path, err)
+		logger.Panicf("FATAL: cannot open file %q for reading: %s", path, err)
 	}
 	var r ReaderAt
 	r.f = f
@@ -163,7 +172,8 @@ func OpenReaderAt(path string) (*ReaderAt, error) {
 	if !*disableMmap {
 		fi, err := f.Stat()
 		if err != nil {
-			return nil, fmt.Errorf("error in stat: %w", err)
+			MustClose(f)
+			logger.Panicf("FATAL: error in fstat(%q): %s", path, err)
 		}
 		size := fi.Size()
 		bm := &pageCacheBitmap{
@@ -179,12 +189,12 @@ func OpenReaderAt(path string) (*ReaderAt, error) {
 		data, err := mmapFile(f, size)
 		if err != nil {
 			MustClose(f)
-			return nil, fmt.Errorf("cannot init reader for %q: %w", path, err)
+			logger.Panicf("FATAL: cannot mmap %q: %s", path, err)
 		}
 		r.mmapData = data
 	}
 	readersCount.Inc()
-	return &r, nil
+	return &r
 }
 
 func pageCacheBitmapCleaner(pcbm *atomic.Value, stopCh <-chan struct{}) {

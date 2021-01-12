@@ -10,6 +10,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/fslocal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envflag"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
@@ -20,7 +21,7 @@ var (
 		"VictoriaMetrics must be stopped when restoring from backup. -storageDataPath dir can be non-empty. In this case the contents of -storageDataPath dir "+
 		"is synchronized with -src contents, i.e. it works like 'rsync --delete'")
 	concurrency             = flag.Int("concurrency", 10, "The number of concurrent workers. Higher concurrency may reduce restore duration")
-	maxBytesPerSecond       = flag.Int("maxBytesPerSecond", 0, "The maximum download speed. There is no limit if it is set to 0")
+	maxBytesPerSecond       = flagutil.NewBytes("maxBytesPerSecond", 0, "The maximum download speed. There is no limit if it is set to 0")
 	skipBackupCompleteCheck = flag.Bool("skipBackupCompleteCheck", false, "Whether to skip checking for 'backup complete' file in -src. This may be useful for restoring from old backups, which were created without 'backup complete' file")
 )
 
@@ -30,6 +31,7 @@ func main() {
 	flag.Usage = usage
 	envflag.Parse()
 	buildinfo.Init()
+	logger.Init()
 
 	srcFS, err := newSrcFS()
 	if err != nil {
@@ -48,18 +50,17 @@ func main() {
 	if err := a.Run(); err != nil {
 		logger.Fatalf("cannot restore from backup: %s", err)
 	}
+	srcFS.MustStop()
+	dstFS.MustStop()
 }
 
 func usage() {
 	const s = `
 vmrestore restores VictoriaMetrics data from backups made by vmbackup.
 
-See the docs at https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/app/vmrestore/README.md .
+See the docs at https://victoriametrics.github.io/vmrestore.html .
 `
-
-	f := flag.CommandLine.Output()
-	fmt.Fprintf(f, "%s\n", s)
-	flag.PrintDefaults()
+	flagutil.Usage(s)
 }
 
 func newDstFS() (*fslocal.FS, error) {
@@ -68,7 +69,7 @@ func newDstFS() (*fslocal.FS, error) {
 	}
 	fs := &fslocal.FS{
 		Dir:               *storageDataPath,
-		MaxBytesPerSecond: *maxBytesPerSecond,
+		MaxBytesPerSecond: maxBytesPerSecond.N,
 	}
 	if err := fs.Init(); err != nil {
 		return nil, fmt.Errorf("cannot initialize local fs: %w", err)

@@ -4,12 +4,13 @@ import (
 	"flag"
 	"io"
 	"net/http"
-	"runtime"
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/influx"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
@@ -64,16 +65,17 @@ func insertRows(db string, rows []parser.Row) error {
 	hasRelabeling := relabel.HasRelabeling()
 	for i := range rows {
 		r := &rows[i]
+		rowsTotal += len(r.Fields)
 		ic.Labels = ic.Labels[:0]
-		hasDBLabel := false
+		hasDBKey := false
 		for j := range r.Tags {
 			tag := &r.Tags[j]
 			if tag.Key == "db" {
-				hasDBLabel = true
+				hasDBKey = true
 			}
 			ic.AddLabel(tag.Key, tag.Value)
 		}
-		if len(db) > 0 && !hasDBLabel {
+		if !hasDBKey {
 			ic.AddLabel("db", db)
 		}
 		ctx.metricGroupBuf = ctx.metricGroupBuf[:0]
@@ -85,31 +87,45 @@ func insertRows(db string, rows []parser.Row) error {
 			ctx.metricGroupBuf = append(ctx.metricGroupBuf, *measurementFieldSeparator...)
 		}
 		metricGroupPrefixLen := len(ctx.metricGroupBuf)
-		ctx.metricNameBuf = ctx.metricNameBuf[:0]
-		if !hasRelabeling {
-			ctx.metricNameBuf = storage.MarshalMetricNameRaw(ctx.metricNameBuf, ic.Labels)
+		if hasRelabeling {
+			ctx.originLabels = append(ctx.originLabels[:0], ic.Labels...)
+			for j := range r.Fields {
+				f := &r.Fields[j]
+				if !skipFieldKey {
+					ctx.metricGroupBuf = append(ctx.metricGroupBuf[:metricGroupPrefixLen], f.Key...)
+				}
+				metricGroup := bytesutil.ToUnsafeString(ctx.metricGroupBuf)
+				ic.Labels = append(ic.Labels[:0], ctx.originLabels...)
+				ic.AddLabel("", metricGroup)
+				ic.ApplyRelabeling()
+				if len(ic.Labels) == 0 {
+					// Skip metric without labels.
+					continue
+				}
+				if err := ic.WriteDataPoint(nil, ic.Labels, r.Timestamp, f.Value); err != nil {
+					return err
+				}
+			}
+		} else {
+			ctx.metricNameBuf = storage.MarshalMetricNameRaw(ctx.metricNameBuf[:0], ic.Labels)
+			labelsLen := len(ic.Labels)
+			for j := range r.Fields {
+				f := &r.Fields[j]
+				if !skipFieldKey {
+					ctx.metricGroupBuf = append(ctx.metricGroupBuf[:metricGroupPrefixLen], f.Key...)
+				}
+				metricGroup := bytesutil.ToUnsafeString(ctx.metricGroupBuf)
+				ic.Labels = ic.Labels[:labelsLen]
+				ic.AddLabel("", metricGroup)
+				if len(ic.Labels) == 0 {
+					// Skip metric without labels.
+					continue
+				}
+				if err := ic.WriteDataPoint(ctx.metricNameBuf, ic.Labels[len(ic.Labels)-1:], r.Timestamp, f.Value); err != nil {
+					return err
+				}
+			}
 		}
-		labelsLen := len(ic.Labels)
-		for j := range r.Fields {
-			f := &r.Fields[j]
-			if !skipFieldKey {
-				ctx.metricGroupBuf = append(ctx.metricGroupBuf[:metricGroupPrefixLen], f.Key...)
-			}
-			metricGroup := bytesutil.ToUnsafeString(ctx.metricGroupBuf)
-			ic.Labels = ic.Labels[:labelsLen]
-			ic.AddLabel("", metricGroup)
-			ic.ApplyRelabeling() // this must be called even if !hasRelabeling in order to remove labels with empty values
-			if len(ic.Labels) == 0 {
-				// Skip metric without labels.
-				continue
-			}
-			labels := ic.Labels
-			if !hasRelabeling {
-				labels = labels[len(labels)-1:]
-			}
-			ic.WriteDataPoint(ctx.metricNameBuf, labels, r.Timestamp, f.Value)
-		}
-		rowsTotal += len(r.Fields)
 	}
 	rowsInserted.Add(rowsTotal)
 	rowsPerInsert.Update(float64(rowsTotal))
@@ -120,12 +136,21 @@ type pushCtx struct {
 	Common         common.InsertCtx
 	metricNameBuf  []byte
 	metricGroupBuf []byte
+	originLabels   []prompb.Label
 }
 
 func (ctx *pushCtx) reset() {
 	ctx.Common.Reset(0)
 	ctx.metricNameBuf = ctx.metricNameBuf[:0]
 	ctx.metricGroupBuf = ctx.metricGroupBuf[:0]
+
+	originLabels := ctx.originLabels
+	for i := range originLabels {
+		label := &originLabels[i]
+		label.Name = nil
+		label.Value = nil
+	}
+	ctx.originLabels = ctx.originLabels[:0]
 }
 
 func getPushCtx() *pushCtx {
@@ -150,4 +175,4 @@ func putPushCtx(ctx *pushCtx) {
 }
 
 var pushCtxPool sync.Pool
-var pushCtxPoolCh = make(chan *pushCtx, runtime.GOMAXPROCS(-1))
+var pushCtxPoolCh = make(chan *pushCtx, cgroup.AvailableCPUs())

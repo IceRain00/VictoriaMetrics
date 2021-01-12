@@ -22,10 +22,19 @@ func Push(wr *prompbmarshal.WriteRequest) {
 	tss := wr.Timeseries
 	for len(tss) > 0 {
 		// Process big tss in smaller blocks in order to reduce maxmimum memory usage
+		samplesCount := 0
+		i := 0
+		for i < len(tss) {
+			samplesCount += len(tss[i].Samples)
+			i++
+			if samplesCount > maxRowsPerBlock {
+				break
+			}
+		}
 		tssBlock := tss
-		if len(tssBlock) > maxRowsPerBlock {
-			tssBlock = tss[:maxRowsPerBlock]
-			tss = tss[maxRowsPerBlock:]
+		if i < len(tss) {
+			tssBlock = tss[:i]
+			tss = tss[i:]
 		} else {
 			tss = nil
 		}
@@ -42,6 +51,7 @@ func push(ctx *common.InsertCtx, tss []prompbmarshal.TimeSeries) {
 	rowsTotal := 0
 	for i := range tss {
 		ts := &tss[i]
+		rowsTotal += len(ts.Samples)
 		ctx.Labels = ctx.Labels[:0]
 		for j := range ts.Labels {
 			label := &ts.Labels[j]
@@ -53,11 +63,15 @@ func push(ctx *common.InsertCtx, tss []prompbmarshal.TimeSeries) {
 			continue
 		}
 		var metricNameRaw []byte
+		var err error
 		for i := range ts.Samples {
 			r := &ts.Samples[i]
-			metricNameRaw = ctx.WriteDataPointExt(metricNameRaw, ctx.Labels, r.Timestamp, r.Value)
+			metricNameRaw, err = ctx.WriteDataPointExt(metricNameRaw, ctx.Labels, r.Timestamp, r.Value)
+			if err != nil {
+				logger.Errorf("cannot write promscape data to storage: %s", err)
+				return
+			}
 		}
-		rowsTotal += len(ts.Samples)
 	}
 	rowsInserted.Add(rowsTotal)
 	rowsPerInsert.Update(float64(rowsTotal))

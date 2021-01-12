@@ -6,8 +6,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/persistentqueue"
@@ -22,20 +23,35 @@ var (
 		"It is recommended using VictoriaMetrics as remote storage. Example url: http://<victoriametrics-host>:8428/api/v1/write . "+
 		"Pass multiple -remoteWrite.url flags in order to write data concurrently to multiple remote storage systems")
 	tmpDataPath = flag.String("remoteWrite.tmpDataPath", "vmagent-remotewrite-data", "Path to directory where temporary data for remote write component is stored")
-	queues      = flag.Int("remoteWrite.queues", 1, "The number of concurrent queues to each -remoteWrite.url. Set more queues if a single queue "+
+	queues      = flag.Int("remoteWrite.queues", 4, "The number of concurrent queues to each -remoteWrite.url. Set more queues if default number of queues "+
 		"isn't enough for sending high volume of collected data to remote storage")
 	showRemoteWriteURL = flag.Bool("remoteWrite.showURL", false, "Whether to show -remoteWrite.url in the exported metrics. "+
 		"It is hidden by default, since it can contain sensitive info such as auth key")
-	maxPendingBytesPerURL = flag.Int("remoteWrite.maxDiskUsagePerURL", 0, "The maximum file-based buffer size in bytes at -remoteWrite.tmpDataPath "+
+	maxPendingBytesPerURL = flagutil.NewBytes("remoteWrite.maxDiskUsagePerURL", 0, "The maximum file-based buffer size in bytes at -remoteWrite.tmpDataPath "+
 		"for each -remoteWrite.url. When buffer size reaches the configured maximum, then old data is dropped when adding new data to the buffer. "+
 		"Buffered data is stored in ~500MB chunks, so the minimum practical value for this flag is 500000000. "+
 		"Disk usage is unlimited if the value is set to 0")
+	significantFigures = flag.Int("remoteWrite.significantFigures", 0, "The number of significant figures to leave in metric values before writing them to remote storage. "+
+		"See https://en.wikipedia.org/wiki/Significant_figures . Zero value saves all the significant figures. "+
+		"This option may be used for increasing on-disk compression level for the stored metrics")
 )
 
 var rwctxs []*remoteWriteCtx
 
 // Contains the current relabelConfigs.
 var allRelabelConfigs atomic.Value
+
+// maxQueues limits the maximum value for `-remoteWrite.queues`. There is no sense in setting too high value,
+// since it may lead to high memory usage due to big number of buffers.
+var maxQueues = cgroup.AvailableCPUs() * 4
+
+// InitSecretFlags must be called after flag.Parse and before any logging.
+func InitSecretFlags() {
+	if !*showRemoteWriteURL {
+		// remoteWrite.url can contain authentication codes, so hide it at `/metrics` output.
+		flagutil.RegisterSecretFlag("remoteWrite.url")
+	}
+}
 
 // Init initializes remotewrite.
 //
@@ -44,12 +60,13 @@ var allRelabelConfigs atomic.Value
 // Stop must be called for graceful shutdown.
 func Init() {
 	if len(*remoteWriteURLs) == 0 {
-		logger.Fatalf("at least one `-remoteWrite.url` must be set")
+		logger.Fatalf("at least one `-remoteWrite.url` command-line flag must be set")
 	}
-
-	if !*showRemoteWriteURL {
-		// remoteWrite.url can contain authentication codes, so hide it at `/metrics` output.
-		httpserver.RegisterSecretFlag("remoteWrite.url")
+	if *queues > maxQueues {
+		*queues = maxQueues
+	}
+	if *queues <= 0 {
+		*queues = 1
 	}
 	initLabelsGlobal()
 	rcs, err := loadRelabelConfigs()
@@ -69,11 +86,11 @@ func Init() {
 		maxInmemoryBlocks = 2
 	}
 	for i, remoteWriteURL := range *remoteWriteURLs {
-		urlLabelValue := fmt.Sprintf("secret-url-%d", i+1)
+		sanitizedURL := fmt.Sprintf("%d:secret-url", i+1)
 		if *showRemoteWriteURL {
-			urlLabelValue = remoteWriteURL
+			sanitizedURL = fmt.Sprintf("%d:%s", i+1, remoteWriteURL)
 		}
-		rwctx := newRemoteWriteCtx(i, remoteWriteURL, maxInmemoryBlocks, urlLabelValue)
+		rwctx := newRemoteWriteCtx(i, remoteWriteURL, maxInmemoryBlocks, sanitizedURL)
 		rwctxs = append(rwctxs, rwctx)
 	}
 
@@ -118,8 +135,19 @@ func Stop() {
 
 // Push sends wr to remote storage systems set via `-remoteWrite.url`.
 //
-// Note that wr may be modified by Push due to relabeling.
+// Note that wr may be modified by Push due to relabeling and rounding.
 func Push(wr *prompbmarshal.WriteRequest) {
+	if *significantFigures > 0 {
+		// Round values according to significantFigures
+		for i := range wr.Timeseries {
+			samples := wr.Timeseries[i].Samples
+			for j := range samples {
+				s := &samples[j]
+				s.Value = decimal.Round(s.Value, *significantFigures)
+			}
+		}
+	}
+
 	var rctx *relabelCtx
 	rcs := allRelabelConfigs.Load().(*relabelConfigs)
 	prcsGlobal := rcs.global
@@ -129,10 +157,19 @@ func Push(wr *prompbmarshal.WriteRequest) {
 	tss := wr.Timeseries
 	for len(tss) > 0 {
 		// Process big tss in smaller blocks in order to reduce the maximum memory usage
+		samplesCount := 0
+		i := 0
+		for i < len(tss) {
+			samplesCount += len(tss[i].Samples)
+			i++
+			if samplesCount > maxRowsPerBlock {
+				break
+			}
+		}
 		tssBlock := tss
-		if len(tssBlock) > maxRowsPerBlock {
-			tssBlock = tss[:maxRowsPerBlock]
-			tss = tss[maxRowsPerBlock:]
+		if i < len(tss) {
+			tssBlock = tss[:i]
+			tss = tss[i:]
 		} else {
 			tss = nil
 		}
@@ -165,17 +202,17 @@ type remoteWriteCtx struct {
 	relabelMetricsDropped *metrics.Counter
 }
 
-func newRemoteWriteCtx(argIdx int, remoteWriteURL string, maxInmemoryBlocks int, urlLabelValue string) *remoteWriteCtx {
+func newRemoteWriteCtx(argIdx int, remoteWriteURL string, maxInmemoryBlocks int, sanitizedURL string) *remoteWriteCtx {
 	h := xxhash.Sum64([]byte(remoteWriteURL))
-	path := fmt.Sprintf("%s/persistent-queue/%016X", *tmpDataPath, h)
-	fq := persistentqueue.MustOpenFastQueue(path, remoteWriteURL, maxInmemoryBlocks, *maxPendingBytesPerURL)
-	_ = metrics.GetOrCreateGauge(fmt.Sprintf(`vmagent_remotewrite_pending_data_bytes{path=%q, url=%q}`, path, urlLabelValue), func() float64 {
+	path := fmt.Sprintf("%s/persistent-queue/%d_%016X", *tmpDataPath, argIdx+1, h)
+	fq := persistentqueue.MustOpenFastQueue(path, sanitizedURL, maxInmemoryBlocks, maxPendingBytesPerURL.N)
+	_ = metrics.GetOrCreateGauge(fmt.Sprintf(`vmagent_remotewrite_pending_data_bytes{path=%q, url=%q}`, path, sanitizedURL), func() float64 {
 		return float64(fq.GetPendingBytes())
 	})
-	_ = metrics.GetOrCreateGauge(fmt.Sprintf(`vmagent_remotewrite_pending_inmemory_blocks{path=%q, url=%q}`, path, urlLabelValue), func() float64 {
+	_ = metrics.GetOrCreateGauge(fmt.Sprintf(`vmagent_remotewrite_pending_inmemory_blocks{path=%q, url=%q}`, path, sanitizedURL), func() float64 {
 		return float64(fq.GetInmemoryQueueLen())
 	})
-	c := newClient(argIdx, remoteWriteURL, urlLabelValue, fq, *queues)
+	c := newClient(argIdx, remoteWriteURL, sanitizedURL, fq, *queues)
 	pss := make([]*pendingSeries, *queues)
 	for i := range pss {
 		pss[i] = newPendingSeries(fq.MustWriteBlock)
@@ -186,7 +223,7 @@ func newRemoteWriteCtx(argIdx int, remoteWriteURL string, maxInmemoryBlocks int,
 		c:   c,
 		pss: pss,
 
-		relabelMetricsDropped: metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_relabel_metrics_dropped_total{path=%q, url=%q}`, path, urlLabelValue)),
+		relabelMetricsDropped: metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_relabel_metrics_dropped_total{path=%q, url=%q}`, path, sanitizedURL)),
 	}
 }
 

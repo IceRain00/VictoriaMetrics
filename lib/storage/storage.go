@@ -8,25 +8,29 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storagepacelimiter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/workingsetcache"
 	"github.com/VictoriaMetrics/fastcache"
 )
 
-const maxRetentionMonths = 12 * 100
+const (
+	msecsPerMonth     = 31 * 24 * 3600 * 1000
+	maxRetentionMsecs = 100 * 12 * msecsPerMonth
+)
 
 // Storage represents TSDB storage.
 type Storage struct {
@@ -39,13 +43,16 @@ type Storage struct {
 	addRowsConcurrencyLimitTimeout uint64
 	addRowsConcurrencyDroppedRows  uint64
 
+	searchTSIDsConcurrencyLimitReached uint64
+	searchTSIDsConcurrencyLimitTimeout uint64
+
 	slowRowInserts         uint64
 	slowPerDayIndexInserts uint64
 	slowMetricNameLoads    uint64
 
-	path            string
-	cachePath       string
-	retentionMonths int
+	path           string
+	cachePath      string
+	retentionMsecs int64
 
 	// lock file for exclusive access to the storage on the given path.
 	flockF *os.File
@@ -91,10 +98,9 @@ type Storage struct {
 
 	stop chan struct{}
 
-	currHourMetricIDsUpdaterWG   sync.WaitGroup
-	nextDayMetricIDsUpdaterWG    sync.WaitGroup
-	retentionWatcherWG           sync.WaitGroup
-	prefetchedMetricIDsCleanerWG sync.WaitGroup
+	currHourMetricIDsUpdaterWG sync.WaitGroup
+	nextDayMetricIDsUpdaterWG  sync.WaitGroup
+	retentionWatcherWG         sync.WaitGroup
 
 	// The snapshotLock prevents from concurrent creation of snapshots,
 	// since this may result in snapshots without recently added data,
@@ -103,23 +109,19 @@ type Storage struct {
 	snapshotLock sync.Mutex
 }
 
-// OpenStorage opens storage on the given path with the given number of retention months.
-func OpenStorage(path string, retentionMonths int) (*Storage, error) {
-	if retentionMonths > maxRetentionMonths {
-		return nil, fmt.Errorf("too big retentionMonths=%d; cannot exceed %d", retentionMonths, maxRetentionMonths)
-	}
-	if retentionMonths <= 0 {
-		retentionMonths = maxRetentionMonths
-	}
+// OpenStorage opens storage on the given path with the given retentionMsecs.
+func OpenStorage(path string, retentionMsecs int64) (*Storage, error) {
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine absolute path for %q: %w", path, err)
 	}
-
+	if retentionMsecs <= 0 {
+		retentionMsecs = maxRetentionMsecs
+	}
 	s := &Storage{
-		path:            path,
-		cachePath:       path + "/cache",
-		retentionMonths: retentionMonths,
+		path:           path,
+		cachePath:      path + "/cache",
+		retentionMsecs: retentionMsecs,
 
 		stop: make(chan struct{}),
 	}
@@ -166,7 +168,7 @@ func OpenStorage(path string, retentionMonths int) (*Storage, error) {
 	if err := fs.MkdirAllIfNotExist(idbSnapshotsPath); err != nil {
 		return nil, fmt.Errorf("cannot create %q: %w", idbSnapshotsPath, err)
 	}
-	idbCurr, idbPrev, err := openIndexDBTables(idbPath, s.metricIDCache, s.metricNameCache, s.tsidCache, &s.currHourMetricIDs, &s.prevHourMetricIDs)
+	idbCurr, idbPrev, err := openIndexDBTables(idbPath, s.metricIDCache, s.metricNameCache, s.tsidCache)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open indexdb tables at %q: %w", idbPath, err)
 	}
@@ -175,7 +177,7 @@ func OpenStorage(path string, retentionMonths int) (*Storage, error) {
 
 	// Load data
 	tablePath := path + "/data"
-	tb, err := openTable(tablePath, retentionMonths, s.getDeletedMetricIDs)
+	tb, err := openTable(tablePath, s.getDeletedMetricIDs, retentionMsecs)
 	if err != nil {
 		s.idb().MustClose()
 		return nil, fmt.Errorf("cannot open table at %q: %w", tablePath, err)
@@ -185,13 +187,12 @@ func OpenStorage(path string, retentionMonths int) (*Storage, error) {
 	s.startCurrHourMetricIDsUpdater()
 	s.startNextDayMetricIDsUpdater()
 	s.startRetentionWatcher()
-	s.startPrefetchedMetricIDsCleaner()
 
 	return s, nil
 }
 
-// debugFlush flushes recently added storage data, so it becomes visible to search.
-func (s *Storage) debugFlush() {
+// DebugFlush flushes recently added storage data, so it becomes visible to search.
+func (s *Storage) DebugFlush() {
 	s.tb.flushRawRows()
 	s.idb().tb.DebugFlush()
 }
@@ -316,6 +317,7 @@ func (s *Storage) idb() *indexDB {
 
 // Metrics contains essential metrics for the Storage.
 type Metrics struct {
+	RowsAddedTotal    uint64
 	DedupsDuringMerge uint64
 
 	TooSmallTimestampRows uint64
@@ -327,11 +329,19 @@ type Metrics struct {
 	AddRowsConcurrencyCapacity     uint64
 	AddRowsConcurrencyCurrent      uint64
 
+	SearchTSIDsConcurrencyLimitReached uint64
+	SearchTSIDsConcurrencyLimitTimeout uint64
+	SearchTSIDsConcurrencyCapacity     uint64
+	SearchTSIDsConcurrencyCurrent      uint64
+
 	SearchDelays uint64
 
 	SlowRowInserts         uint64
 	SlowPerDayIndexInserts uint64
 	SlowMetricNameLoads    uint64
+
+	TimestampsBlocksMerged uint64
+	TimestampsBytesSaved   uint64
 
 	TSIDCacheSize       uint64
 	TSIDCacheSizeBytes  uint64
@@ -376,6 +386,7 @@ func (m *Metrics) Reset() {
 
 // UpdateMetrics updates m with metrics from s.
 func (s *Storage) UpdateMetrics(m *Metrics) {
+	m.RowsAddedTotal = atomic.LoadUint64(&rowsAddedTotal)
 	m.DedupsDuringMerge = atomic.LoadUint64(&dedupsDuringMerge)
 
 	m.TooSmallTimestampRows += atomic.LoadUint64(&s.tooSmallTimestampRows)
@@ -387,11 +398,19 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 	m.AddRowsConcurrencyCapacity = uint64(cap(addRowsConcurrencyCh))
 	m.AddRowsConcurrencyCurrent = uint64(len(addRowsConcurrencyCh))
 
-	m.SearchDelays += atomic.LoadUint64(&searchDelays)
+	m.SearchTSIDsConcurrencyLimitReached += atomic.LoadUint64(&s.searchTSIDsConcurrencyLimitReached)
+	m.SearchTSIDsConcurrencyLimitTimeout += atomic.LoadUint64(&s.searchTSIDsConcurrencyLimitTimeout)
+	m.SearchTSIDsConcurrencyCapacity = uint64(cap(searchTSIDsConcurrencyCh))
+	m.SearchTSIDsConcurrencyCurrent = uint64(len(searchTSIDsConcurrencyCh))
+
+	m.SearchDelays = storagepacelimiter.Search.DelaysTotal()
 
 	m.SlowRowInserts += atomic.LoadUint64(&s.slowRowInserts)
 	m.SlowPerDayIndexInserts += atomic.LoadUint64(&s.slowPerDayIndexInserts)
 	m.SlowMetricNameLoads += atomic.LoadUint64(&s.slowMetricNameLoads)
+
+	m.TimestampsBlocksMerged = atomic.LoadUint64(&timestampsBlocksMerged)
+	m.TimestampsBytesSaved = atomic.LoadUint64(&timestampsBytesSaved)
 
 	var cs fastcache.Stats
 	s.tsidCache.UpdateStats(&cs)
@@ -444,27 +463,6 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 	s.tb.UpdateMetrics(&m.TableMetrics)
 }
 
-func (s *Storage) startPrefetchedMetricIDsCleaner() {
-	s.prefetchedMetricIDsCleanerWG.Add(1)
-	go func() {
-		s.prefetchedMetricIDsCleaner()
-		s.prefetchedMetricIDsCleanerWG.Done()
-	}()
-}
-
-func (s *Storage) prefetchedMetricIDsCleaner() {
-	t := time.NewTicker(7 * time.Minute)
-	for {
-		select {
-		case <-s.stop:
-			t.Stop()
-			return
-		case <-t.C:
-			s.prefetchedMetricIDs.Store(&uint64set.Set{})
-		}
-	}
-}
-
 func (s *Storage) startRetentionWatcher() {
 	s.retentionWatcherWG.Add(1)
 	go func() {
@@ -474,8 +472,9 @@ func (s *Storage) startRetentionWatcher() {
 }
 
 func (s *Storage) retentionWatcher() {
+	retentionMonths := int((s.retentionMsecs + (msecsPerMonth - 1)) / msecsPerMonth)
 	for {
-		d := nextRetentionDuration(s.retentionMonths)
+		d := nextRetentionDuration(retentionMonths)
 		select {
 		case <-s.stop:
 			return
@@ -537,7 +536,7 @@ func (s *Storage) mustRotateIndexDB() {
 	// Create new indexdb table.
 	newTableName := nextIndexDBTableName()
 	idbNewPath := s.path + "/indexdb/" + newTableName
-	idbNew, err := openIndexDB(idbNewPath, s.metricIDCache, s.metricNameCache, s.tsidCache, &s.currHourMetricIDs, &s.prevHourMetricIDs)
+	idbNew, err := openIndexDB(idbNewPath, s.metricIDCache, s.metricNameCache, s.tsidCache)
 	if err != nil {
 		logger.Panicf("FATAL: cannot create new indexDB at %q: %s", idbNewPath, err)
 	}
@@ -797,43 +796,98 @@ func nextRetentionDuration(retentionMonths int) time.Duration {
 	return deadline.Sub(t)
 }
 
-var (
-	searchTSIDsCondLock sync.Mutex
-	searchTSIDsCond     = sync.NewCond(&searchTSIDsCondLock)
-
-	searchDelays uint64
-)
+// SearchMetricNames returns metric names matching the given tfss on the given tr.
+func (s *Storage) SearchMetricNames(tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) ([]MetricName, error) {
+	tsids, err := s.searchTSIDs(tfss, tr, maxMetrics, deadline)
+	if err != nil {
+		return nil, err
+	}
+	if err = s.prefetchMetricNames(tsids, deadline); err != nil {
+		return nil, err
+	}
+	idb := s.idb()
+	is := idb.getIndexSearch(deadline)
+	defer idb.putIndexSearch(is)
+	mns := make([]MetricName, 0, len(tsids))
+	var metricName []byte
+	for i := range tsids {
+		metricID := tsids[i].MetricID
+		var err error
+		metricName, err = is.searchMetricName(metricName[:0], metricID)
+		if err != nil {
+			if err == io.EOF {
+				// Skip missing metricName for metricID.
+				// It should be automatically fixed. See indexDB.searchMetricName for details.
+				continue
+			}
+			return nil, fmt.Errorf("error when searching metricName for metricID=%d: %w", metricID, err)
+		}
+		mns = mns[:len(mns)+1]
+		mn := &mns[len(mns)-1]
+		if err = mn.Unmarshal(metricName); err != nil {
+			return nil, fmt.Errorf("cannot unmarshal metricName=%q: %w", metricName, err)
+		}
+	}
+	return mns, nil
+}
 
 // searchTSIDs returns sorted TSIDs for the given tfss and the given tr.
-func (s *Storage) searchTSIDs(tfss []*TagFilters, tr TimeRange, maxMetrics int) ([]TSID, error) {
-	// Make sure that there are enough resources for processing the ingested data via Storage.AddRows
-	// before starting the query.
-	// This should prevent from data ingestion starvation when provessing heavy queries.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/291 .
-	searchTSIDsCondLock.Lock()
-	for len(addRowsConcurrencyCh) >= cap(addRowsConcurrencyCh) {
-		atomic.AddUint64(&searchDelays, 1)
-		searchTSIDsCond.Wait()
-	}
-	searchTSIDsCondLock.Unlock()
-
+func (s *Storage) searchTSIDs(tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) ([]TSID, error) {
 	// Do not cache tfss -> tsids here, since the caching is performed
 	// on idb level.
-	tsids, err := s.idb().searchTSIDs(tfss, tr, maxMetrics)
+
+	// Limit the number of concurrent goroutines that may search TSIDS in the storage.
+	// This should prevent from out of memory errors and CPU trashing when too many
+	// goroutines call searchTSIDs.
+	select {
+	case searchTSIDsConcurrencyCh <- struct{}{}:
+	default:
+		// Sleep for a while until giving up
+		atomic.AddUint64(&s.searchTSIDsConcurrencyLimitReached, 1)
+		currentTime := fasttime.UnixTimestamp()
+		timeoutSecs := uint64(0)
+		if currentTime < deadline {
+			timeoutSecs = deadline - currentTime
+		}
+		timeout := time.Second * time.Duration(timeoutSecs)
+		t := timerpool.Get(timeout)
+		select {
+		case searchTSIDsConcurrencyCh <- struct{}{}:
+			timerpool.Put(t)
+		case <-t.C:
+			timerpool.Put(t)
+			atomic.AddUint64(&s.searchTSIDsConcurrencyLimitTimeout, 1)
+			return nil, fmt.Errorf("cannot search for tsids, since more than %d concurrent searches are performed during %.3f secs; add more CPUs or reduce query load",
+				cap(searchTSIDsConcurrencyCh), timeout.Seconds())
+		}
+	}
+	tsids, err := s.idb().searchTSIDs(tfss, tr, maxMetrics, deadline)
+	<-searchTSIDsConcurrencyCh
 	if err != nil {
-		return nil, fmt.Errorf("error when searching tsids for tfss %q: %w", tfss, err)
+		return nil, fmt.Errorf("error when searching tsids: %w", err)
 	}
 	return tsids, nil
 }
 
+var (
+	// Limit the concurrency for TSID searches to GOMAXPROCS*2, since this operation
+	// is CPU bound and sometimes disk IO bound, so there is no sense in running more
+	// than GOMAXPROCS*2 concurrent goroutines for TSID searches.
+	searchTSIDsConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs()*2)
+)
+
 // prefetchMetricNames pre-fetches metric names for the given tsids into metricID->metricName cache.
 //
 // This should speed-up further searchMetricName calls for metricIDs from tsids.
-func (s *Storage) prefetchMetricNames(tsids []TSID) error {
+func (s *Storage) prefetchMetricNames(tsids []TSID, deadline uint64) error {
+	if len(tsids) == 0 {
+		return nil
+	}
 	var metricIDs uint64Sorter
 	prefetchedMetricIDs := s.prefetchedMetricIDs.Load().(*uint64set.Set)
 	for i := range tsids {
-		metricID := tsids[i].MetricID
+		tsid := &tsids[i]
+		metricID := tsid.MetricID
 		if prefetchedMetricIDs.Has(metricID) {
 			continue
 		}
@@ -850,9 +904,14 @@ func (s *Storage) prefetchMetricNames(tsids []TSID) error {
 	var metricName []byte
 	var err error
 	idb := s.idb()
-	is := idb.getIndexSearch()
+	is := idb.getIndexSearch(deadline)
 	defer idb.putIndexSearch(is)
-	for _, metricID := range metricIDs {
+	for loops, metricID := range metricIDs {
+		if loops&paceLimiterSlowIterationsMask == 0 {
+			if err := checkSearchDeadlineAndPace(is.deadline); err != nil {
+				return err
+			}
+		}
 		metricName, err = is.searchMetricName(metricName[:0], metricID)
 		if err != nil && err != io.EOF {
 			return fmt.Errorf("error in pre-fetching metricName for metricID=%d: %w", metricID, err)
@@ -860,13 +919,19 @@ func (s *Storage) prefetchMetricNames(tsids []TSID) error {
 	}
 
 	// Store the pre-fetched metricIDs, so they aren't pre-fetched next time.
+
 	prefetchedMetricIDsNew := prefetchedMetricIDs.Clone()
-	for _, metricID := range metricIDs {
-		prefetchedMetricIDsNew.Add(metricID)
+	prefetchedMetricIDsNew.AddMulti(metricIDs)
+	if prefetchedMetricIDsNew.SizeBytes() > uint64(memory.Allowed())/32 {
+		// Reset prefetchedMetricIDsNew if it occupies too much space.
+		prefetchedMetricIDsNew = &uint64set.Set{}
 	}
 	s.prefetchedMetricIDs.Store(prefetchedMetricIDsNew)
 	return nil
 }
+
+// ErrDeadlineExceeded is returned when the request times out.
+var ErrDeadlineExceeded = fmt.Errorf("deadline exceeded")
 
 // DeleteMetrics deletes all the metrics matching the given tfss.
 //
@@ -891,20 +956,37 @@ func (s *Storage) searchMetricName(dst []byte, metricID uint64) ([]byte, error) 
 	return s.idb().searchMetricName(dst, metricID)
 }
 
+// SearchTagKeysOnTimeRange searches for tag keys on tr.
+func (s *Storage) SearchTagKeysOnTimeRange(tr TimeRange, maxTagKeys int, deadline uint64) ([]string, error) {
+	return s.idb().SearchTagKeysOnTimeRange(tr, maxTagKeys, deadline)
+}
+
 // SearchTagKeys searches for tag keys
-func (s *Storage) SearchTagKeys(maxTagKeys int) ([]string, error) {
-	return s.idb().SearchTagKeys(maxTagKeys)
+func (s *Storage) SearchTagKeys(maxTagKeys int, deadline uint64) ([]string, error) {
+	return s.idb().SearchTagKeys(maxTagKeys, deadline)
+}
+
+// SearchTagValuesOnTimeRange searches for tag values for the given tagKey on tr.
+func (s *Storage) SearchTagValuesOnTimeRange(tagKey []byte, tr TimeRange, maxTagValues int, deadline uint64) ([]string, error) {
+	return s.idb().SearchTagValuesOnTimeRange(tagKey, tr, maxTagValues, deadline)
 }
 
 // SearchTagValues searches for tag values for the given tagKey
-func (s *Storage) SearchTagValues(tagKey []byte, maxTagValues int) ([]string, error) {
-	return s.idb().SearchTagValues(tagKey, maxTagValues)
+func (s *Storage) SearchTagValues(tagKey []byte, maxTagValues int, deadline uint64) ([]string, error) {
+	return s.idb().SearchTagValues(tagKey, maxTagValues, deadline)
+}
+
+// SearchTagValueSuffixes returns all the tag value suffixes for the given tagKey and tagValuePrefix on the given tr.
+//
+// This allows implementing https://graphite-api.readthedocs.io/en/latest/api.html#metrics-find or similar APIs.
+func (s *Storage) SearchTagValueSuffixes(tr TimeRange, tagKey, tagValuePrefix []byte, delimiter byte, maxTagValueSuffixes int, deadline uint64) ([]string, error) {
+	return s.idb().SearchTagValueSuffixes(tr, tagKey, tagValuePrefix, delimiter, maxTagValueSuffixes, deadline)
 }
 
 // SearchTagEntries returns a list of (tagName -> tagValues)
-func (s *Storage) SearchTagEntries(maxTagKeys, maxTagValues int) ([]TagEntry, error) {
+func (s *Storage) SearchTagEntries(maxTagKeys, maxTagValues int, deadline uint64) ([]TagEntry, error) {
 	idb := s.idb()
-	keys, err := idb.SearchTagKeys(maxTagKeys)
+	keys, err := idb.SearchTagKeys(maxTagKeys, deadline)
 	if err != nil {
 		return nil, fmt.Errorf("cannot search tag keys: %w", err)
 	}
@@ -914,7 +996,7 @@ func (s *Storage) SearchTagEntries(maxTagKeys, maxTagValues int) ([]TagEntry, er
 
 	tes := make([]TagEntry, len(keys))
 	for i, key := range keys {
-		values, err := idb.SearchTagValues([]byte(key), maxTagValues)
+		values, err := idb.SearchTagValues([]byte(key), maxTagValues, deadline)
 		if err != nil {
 			return nil, fmt.Errorf("cannot search values for tag %q: %w", key, err)
 		}
@@ -938,15 +1020,15 @@ type TagEntry struct {
 //
 // It includes the deleted series too and may count the same series
 // up to two times - in db and extDB.
-func (s *Storage) GetSeriesCount() (uint64, error) {
-	return s.idb().GetSeriesCount()
+func (s *Storage) GetSeriesCount(deadline uint64) (uint64, error) {
+	return s.idb().GetSeriesCount(deadline)
 }
 
 // GetTSDBStatusForDate returns TSDB status data for /api/v1/status/tsdb.
 //
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#tsdb-stats
-func (s *Storage) GetTSDBStatusForDate(date uint64, topN int) (*TSDBStatus, error) {
-	return s.idb().GetTSDBStatusForDate(date, topN)
+func (s *Storage) GetTSDBStatusForDate(date uint64, topN int, deadline uint64) (*TSDBStatus, error) {
+	return s.idb().GetTSDBStatusForDate(date, topN, deadline)
 }
 
 // MetricRow is a metric to insert into storage.
@@ -1009,6 +1091,15 @@ func (mr *MetricRow) Unmarshal(src []byte) ([]byte, error) {
 	return tail, nil
 }
 
+// ForceMergePartitions force-merges partitions in s with names starting from the given partitionNamePrefix.
+//
+// Partitions are merged sequentially in order to reduce load on the system.
+func (s *Storage) ForceMergePartitions(partitionNamePrefix string) error {
+	return s.tb.ForceMergePartitions(partitionNamePrefix)
+}
+
+var rowsAddedTotal uint64
+
 // AddRows adds the given mrs to s.
 func (s *Storage) AddRows(mrs []MetricRow, precisionBits uint8) error {
 	if len(mrs) == 0 {
@@ -1024,14 +1115,20 @@ func (s *Storage) AddRows(mrs []MetricRow, precisionBits uint8) error {
 		// Sleep for a while until giving up
 		atomic.AddUint64(&s.addRowsConcurrencyLimitReached, 1)
 		t := timerpool.Get(addRowsTimeout)
+
+		// Prioritize data ingestion over concurrent searches.
+		storagepacelimiter.Search.Inc()
+
 		select {
 		case addRowsConcurrencyCh <- struct{}{}:
 			timerpool.Put(t)
+			storagepacelimiter.Search.Dec()
 		case <-t.C:
 			timerpool.Put(t)
+			storagepacelimiter.Search.Dec()
 			atomic.AddUint64(&s.addRowsConcurrencyLimitTimeout, 1)
 			atomic.AddUint64(&s.addRowsConcurrencyDroppedRows, uint64(len(mrs)))
-			return fmt.Errorf("Cannot add %d rows to storage in %s, since it is overloaded with %d concurrent writers. Add more CPUs or reduce load",
+			return fmt.Errorf("cannot add %d rows to storage in %s, since it is overloaded with %d concurrent writers; add more CPUs or reduce load",
 				len(mrs), addRowsTimeout, cap(addRowsConcurrencyCh))
 		}
 	}
@@ -1042,10 +1139,9 @@ func (s *Storage) AddRows(mrs []MetricRow, precisionBits uint8) error {
 	rr.rows, err = s.add(rr.rows, mrs, precisionBits)
 	putRawRows(rr)
 
-	// Notify blocked goroutines at Storage.searchTSIDs that they may proceed with their work.
 	<-addRowsConcurrencyCh
-	searchTSIDsCond.Signal()
 
+	atomic.AddUint64(&rowsAddedTotal, uint64(len(mrs)))
 	return err
 }
 
@@ -1053,9 +1149,67 @@ var (
 	// Limit the concurrency for data ingestion to GOMAXPROCS, since this operation
 	// is CPU bound, so there is no sense in running more than GOMAXPROCS concurrent
 	// goroutines on data ingestion path.
-	addRowsConcurrencyCh = make(chan struct{}, runtime.GOMAXPROCS(-1))
+	addRowsConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs())
 	addRowsTimeout       = 30 * time.Second
 )
+
+// RegisterMetricNames registers all the metric names from mns in the indexdb, so they can be queried later.
+//
+// The the MetricRow.Timestamp is used for registering the metric name starting from the given timestamp.
+// Th MetricRow.Value field is ignored.
+func (s *Storage) RegisterMetricNames(mrs []MetricRow) error {
+	var (
+		tsid       TSID
+		mn         MetricName
+		metricName []byte
+	)
+	idb := s.idb()
+	is := idb.getIndexSearch(noDeadline)
+	defer idb.putIndexSearch(is)
+	for i := range mrs {
+		mr := &mrs[i]
+		if s.getTSIDFromCache(&tsid, mr.MetricNameRaw) {
+			// Fast path - mr.MetricNameRaw has been already registered.
+			continue
+		}
+
+		// Slow path - register mr.MetricNameRaw.
+		if err := mn.unmarshalRaw(mr.MetricNameRaw); err != nil {
+			return fmt.Errorf("cannot register the metric because cannot unmarshal MetricNameRaw %q: %w", mr.MetricNameRaw, err)
+		}
+		mn.sortTags()
+		metricName = mn.Marshal(metricName[:0])
+		if err := is.GetOrCreateTSIDByName(&tsid, metricName); err != nil {
+			return fmt.Errorf("cannot register the metric because cannot create TSID for metricName %q: %w", metricName, err)
+		}
+		s.putTSIDToCache(&tsid, mr.MetricNameRaw)
+
+		// Register the metric in per-day inverted index.
+		date := uint64(mr.Timestamp) / msecPerDay
+		metricID := tsid.MetricID
+		if s.dateMetricIDCache.Has(date, metricID) {
+			// Fast path: the metric has been already registered in per-day inverted index
+			continue
+		}
+
+		// Slow path: acutally register the metric in per-day inverted index.
+		ok, err := is.hasDateMetricID(date, metricID)
+		if err != nil {
+			return fmt.Errorf("cannot register the metric in per-date inverted index because of error when locating (date=%d, metricID=%d) in database: %w",
+				date, metricID, err)
+		}
+		if !ok {
+			// The (date, metricID) entry is missing in the indexDB. Add it there.
+			if err := is.storeDateMetricID(date, metricID); err != nil {
+				return fmt.Errorf("cannot register the metric in per-date inverted index because of error when storing (date=%d, metricID=%d) in database: %w",
+					date, metricID, err)
+			}
+		}
+		// The metric must be added to cache only after it has been successfully added to indexDB.
+		s.dateMetricIDCache.Set(date, metricID)
+	}
+	return nil
+}
 
 func (s *Storage) add(rows []rawRow, mrs []MetricRow, precisionBits uint8) ([]rawRow, error) {
 	idb := s.idb()
@@ -1084,9 +1238,10 @@ func (s *Storage) add(rows []rawRow, mrs []MetricRow, precisionBits uint8) ([]ra
 		if mr.Timestamp < minTimestamp {
 			// Skip rows with too small timestamps outside the retention.
 			if firstWarn == nil {
+				metricName := getUserReadableMetricName(mr.MetricNameRaw)
 				firstWarn = fmt.Errorf("cannot insert row with too small timestamp %d outside the retention; minimum allowed timestamp is %d; "+
-					"probably you need updating -retentionPeriod command-line flag",
-					mr.Timestamp, minTimestamp)
+					"probably you need updating -retentionPeriod command-line flag; metricName: %s",
+					mr.Timestamp, minTimestamp, metricName)
 			}
 			atomic.AddUint64(&s.tooSmallTimestampRows, 1)
 			continue
@@ -1094,9 +1249,9 @@ func (s *Storage) add(rows []rawRow, mrs []MetricRow, precisionBits uint8) ([]ra
 		if mr.Timestamp > maxTimestamp {
 			// Skip rows with too big timestamps significantly exceeding the current time.
 			if firstWarn == nil {
-				firstWarn = fmt.Errorf("cannot insert row with too big timestamp %d exceeding the current time; maximum allowd timestamp is %d; "+
-					"propbably you need updating -retentionPeriod command-line flag",
-					mr.Timestamp, maxTimestamp)
+				metricName := getUserReadableMetricName(mr.MetricNameRaw)
+				firstWarn = fmt.Errorf("cannot insert row with too big timestamp %d exceeding the current time; maximum allowed timestamp is %d; metricName: %s",
+					mr.Timestamp, maxTimestamp, metricName)
 			}
 			atomic.AddUint64(&s.tooBigTimestampRows, 1)
 			continue
@@ -1139,14 +1294,14 @@ func (s *Storage) add(rows []rawRow, mrs []MetricRow, precisionBits uint8) ([]ra
 		}
 	}
 	if pmrs != nil {
-		atomic.AddUint64(&s.slowRowInserts, uint64(len(pmrs.pmrs)))
 		// Sort pendingMetricRows by canonical metric name in order to speed up search via `is` in the loop below.
 		pendingMetricRows := pmrs.pmrs
 		sort.Slice(pendingMetricRows, func(i, j int) bool {
 			return string(pendingMetricRows[i].MetricName) < string(pendingMetricRows[j].MetricName)
 		})
-		is := idb.getIndexSearch()
+		is := idb.getIndexSearch(noDeadline)
 		prevMetricNameRaw = nil
+		var slowInsertsCount uint64
 		for i := range pendingMetricRows {
 			pmr := &pendingMetricRows[i]
 			mr := &pmr.mr
@@ -1170,6 +1325,7 @@ func (s *Storage) add(rows []rawRow, mrs []MetricRow, precisionBits uint8) ([]ra
 				prevMetricNameRaw = mr.MetricNameRaw
 				continue
 			}
+			slowInsertsCount++
 			if err := is.GetOrCreateTSIDByName(&r.TSID, pmr.MetricName); err != nil {
 				// Do not stop adding rows on error - just skip invalid row.
 				// This guarantees that invalid rows don't prevent
@@ -1184,6 +1340,7 @@ func (s *Storage) add(rows []rawRow, mrs []MetricRow, precisionBits uint8) ([]ra
 		}
 		idb.putIndexSearch(is)
 		putPendingMetricRows(pmrs)
+		atomic.AddUint64(&s.slowRowInserts, slowInsertsCount)
 	}
 	if firstWarn != nil {
 		logger.Errorf("warn occurred during rows addition: %s", firstWarn)
@@ -1201,6 +1358,14 @@ func (s *Storage) add(rows []rawRow, mrs []MetricRow, precisionBits uint8) ([]ra
 		return rows, fmt.Errorf("error occurred during rows addition: %w", firstError)
 	}
 	return rows, nil
+}
+
+func getUserReadableMetricName(metricNameRaw []byte) string {
+	var mn MetricName
+	if err := mn.unmarshalRaw(metricNameRaw); err != nil {
+		return fmt.Sprintf("cannot unmarshal metricNameRaw %q: %s", metricNameRaw, err)
+	}
+	return mn.String()
 }
 
 type pendingMetricRow struct {
@@ -1353,7 +1518,7 @@ func (s *Storage) updatePerDateData(rows []rawRow) error {
 		return a.metricID < b.metricID
 	})
 	idb := s.idb()
-	is := idb.getIndexSearch()
+	is := idb.getIndexSearch(noDeadline)
 	defer idb.putIndexSearch(is)
 	var firstError error
 	prevMetricID = 0
@@ -1616,8 +1781,7 @@ func (s *Storage) putTSIDToCache(tsid *TSID, metricName []byte) {
 	s.tsidCache.Set(metricName, buf)
 }
 
-func openIndexDBTables(path string, metricIDCache, metricNameCache, tsidCache *workingsetcache.Cache,
-	currHourMetricIDs, prevHourMetricIDs *atomic.Value) (curr, prev *indexDB, err error) {
+func openIndexDBTables(path string, metricIDCache, metricNameCache, tsidCache *workingsetcache.Cache) (curr, prev *indexDB, err error) {
 	if err := fs.MkdirAllIfNotExist(path); err != nil {
 		return nil, nil, fmt.Errorf("cannot create directory %q: %w", path, err)
 	}
@@ -1676,20 +1840,15 @@ func openIndexDBTables(path string, metricIDCache, metricNameCache, tsidCache *w
 	// Open the last two tables.
 	currPath := path + "/" + tableNames[len(tableNames)-1]
 
-	curr, err = openIndexDB(currPath, metricIDCache, metricNameCache, tsidCache, currHourMetricIDs, prevHourMetricIDs)
+	curr, err = openIndexDB(currPath, metricIDCache, metricNameCache, tsidCache)
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot open curr indexdb table at %q: %w", currPath, err)
 	}
 	prevPath := path + "/" + tableNames[len(tableNames)-2]
-	prev, err = openIndexDB(prevPath, metricIDCache, metricNameCache, tsidCache, currHourMetricIDs, prevHourMetricIDs)
+	prev, err = openIndexDB(prevPath, metricIDCache, metricNameCache, tsidCache)
 	if err != nil {
 		curr.MustClose()
 		return nil, nil, fmt.Errorf("cannot open prev indexdb table at %q: %w", prevPath, err)
-	}
-
-	// Adjust startDateForPerDayInvertedIndex for the previous index.
-	if prev.startDateForPerDayInvertedIndex > curr.startDateForPerDayInvertedIndex {
-		prev.startDateForPerDayInvertedIndex = curr.startDateForPerDayInvertedIndex
 	}
 
 	return curr, prev, nil

@@ -10,6 +10,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/csvimport"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/graphite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/influx"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/native"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/opentsdb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/opentsdbhttp"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/prometheusimport"
@@ -24,6 +25,7 @@ import (
 	opentsdbhttpserver "github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver/opentsdbhttp"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
 	"github.com/VictoriaMetrics/metrics"
@@ -31,12 +33,13 @@ import (
 
 var (
 	graphiteListenAddr = flag.String("graphiteListenAddr", "", "TCP and UDP address to listen for Graphite plaintext data. Usually :2003 must be set. Doesn't work if empty")
-	influxListenAddr   = flag.String("influxListenAddr", "", "TCP and UDP address to listen for Influx line protocol data. Usually :8189 must be set. Doesn't work if empty")
+	influxListenAddr   = flag.String("influxListenAddr", "", "TCP and UDP address to listen for Influx line protocol data. Usually :8189 must be set. Doesn't work if empty. "+
+		"This flag isn't needed when ingesting data over HTTP - just send it to `http://<victoriametrics>:8428/write`")
 	opentsdbListenAddr = flag.String("opentsdbListenAddr", "", "TCP and UDP address to listen for OpentTSDB metrics. "+
 		"Telnet put messages and HTTP /api/put messages are simultaneously served on TCP port. "+
 		"Usually :4242 must be set. Doesn't work if empty")
 	opentsdbHTTPListenAddr = flag.String("opentsdbHTTPListenAddr", "", "TCP address to listen for OpentTSDB HTTP put requests. Usually :4242 must be set. Doesn't work if empty")
-	maxLabelsPerTimeseries = flag.Int("maxLabelsPerTimeseries", 30, "The maximum number of labels accepted per time series. Superflouos labels are dropped")
+	maxLabelsPerTimeseries = flag.Int("maxLabelsPerTimeseries", 30, "The maximum number of labels accepted per time series. Superfluous labels are dropped")
 )
 
 var (
@@ -50,7 +53,7 @@ var (
 func Init() {
 	relabel.Init()
 	storage.SetMaxLabelsPerTimeseries(*maxLabelsPerTimeseries)
-
+	common.StartUnmarshalWorkers()
 	writeconcurrencylimiter.Init()
 	if len(*influxListenAddr) > 0 {
 		influxServer = influxserver.MustStart(*influxListenAddr, influx.InsertHandlerForReader)
@@ -82,6 +85,7 @@ func Stop() {
 	if len(*opentsdbHTTPListenAddr) > 0 {
 		opentsdbhttpServer.MustStop()
 	}
+	common.StopUnmarshalWorkers()
 }
 
 // RequestHandler is a handler for Prometheus remote storage write API
@@ -92,7 +96,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		prometheusWriteRequests.Inc()
 		if err := promremotewrite.InsertHandler(r); err != nil {
 			prometheusWriteErrors.Inc()
-			httpserver.Errorf(w, "error in %q: %s", r.URL.Path, err)
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
 			return true
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -101,7 +105,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		vmimportRequests.Inc()
 		if err := vmimport.InsertHandler(r); err != nil {
 			vmimportErrors.Inc()
-			httpserver.Errorf(w, "error in %q: %s", r.URL.Path, err)
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
 			return true
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -110,7 +114,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		csvimportRequests.Inc()
 		if err := csvimport.InsertHandler(r); err != nil {
 			csvimportErrors.Inc()
-			httpserver.Errorf(w, "error in %q: %s", r.URL.Path, err)
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
 			return true
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -119,7 +123,16 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		prometheusimportRequests.Inc()
 		if err := prometheusimport.InsertHandler(r); err != nil {
 			prometheusimportErrors.Inc()
-			httpserver.Errorf(w, "error in %q: %s", r.URL.Path, err)
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
+			return true
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	case "/api/v1/import/native":
+		nativeimportRequests.Inc()
+		if err := native.InsertHandler(r); err != nil {
+			nativeimportErrors.Inc()
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
 			return true
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -128,7 +141,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		influxWriteRequests.Inc()
 		if err := influx.InsertHandlerForHTTP(r); err != nil {
 			influxWriteErrors.Inc()
-			httpserver.Errorf(w, "error in %q: %s", r.URL.Path, err)
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
 			return true
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -141,13 +154,28 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	case "/targets":
 		promscrapeTargetsRequests.Inc()
-		w.Header().Set("Content-Type", "text/plain")
-		promscrape.WriteHumanReadableTargetsStatus(w)
+		promscrape.WriteHumanReadableTargetsStatus(w, r)
+		return true
+	case "/api/v1/targets":
+		promscrapeAPIV1TargetsRequests.Inc()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		state := r.FormValue("state")
+		promscrape.WriteAPIV1Targets(w, state)
 		return true
 	case "/-/reload":
 		promscrapeConfigReloadRequests.Inc()
 		procutil.SelfSIGHUP()
 		w.WriteHeader(http.StatusNoContent)
+		return true
+	case "/ready":
+		if rdy := atomic.LoadInt32(&promscrape.PendingScrapeConfigs); rdy > 0 {
+			errMsg := fmt.Sprintf("waiting for scrape config to init targets, configs left: %d", rdy)
+			http.Error(w, errMsg, http.StatusTooEarly)
+		} else {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK"))
+		}
 		return true
 	default:
 		// This is not our link
@@ -168,12 +196,16 @@ var (
 	prometheusimportRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/import/prometheus", protocol="prometheusimport"}`)
 	prometheusimportErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/api/v1/import/prometheus", protocol="prometheusimport"}`)
 
+	nativeimportRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/import/native", protocol="nativeimport"}`)
+	nativeimportErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/api/v1/import/native", protocol="nativeimport"}`)
+
 	influxWriteRequests = metrics.NewCounter(`vm_http_requests_total{path="/write", protocol="influx"}`)
 	influxWriteErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/write", protocol="influx"}`)
 
 	influxQueryRequests = metrics.NewCounter(`vm_http_requests_total{path="/query", protocol="influx"}`)
 
-	promscrapeTargetsRequests = metrics.NewCounter(`vm_http_requests_total{path="/targets"}`)
+	promscrapeTargetsRequests      = metrics.NewCounter(`vm_http_requests_total{path="/targets"}`)
+	promscrapeAPIV1TargetsRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/targets"}`)
 
 	promscrapeConfigReloadRequests = metrics.NewCounter(`vm_http_requests_total{path="/-/reload"}`)
 

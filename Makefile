@@ -10,6 +10,8 @@ endif
 
 GO_BUILDINFO = -X '$(PKG_PREFIX)/lib/buildinfo.Version=$(APP_NAME)-$(shell date -u +'%Y%m%d-%H%M%S')-$(BUILDINFO_TAG)'
 
+.PHONY: $(MAKECMDGOALS)
+
 all: \
 	victoria-metrics-prod \
 	vmagent-prod \
@@ -47,6 +49,17 @@ vmutils: \
 	vmbackup \
 	vmrestore
 
+vmutils-arm64: \
+	vmagent-arm64 \
+	vmalert-arm64 \
+	vmauth-arm64 \
+	vmbackup-arm64 \
+	vmrestore-arm64
+
+release-snap:
+	snapcraft
+	snapcraft upload "victoriametrics_$(PKG_TAG)_multi.snap" --release beta,edge,candidate
+
 release: \
 	release-victoria-metrics \
 	release-vmutils
@@ -64,6 +77,16 @@ release-vmutils: \
 	cd bin && tar czf vmutils-$(PKG_TAG).tar.gz vmagent-prod vmalert-prod vmauth-prod vmbackup-prod vmrestore-prod && \
 		sha256sum vmutils-$(PKG_TAG).tar.gz > vmutils-$(PKG_TAG)_checksums.txt
 
+release-vmutils-arm64: \
+	vmagent-arm64-prod \
+	vmalert-arm64-prod \
+	vmauth-arm64-prod \
+	vmbackup-arm64-prod \
+	vmrestore-arm64-prod
+	cd bin && tar czf vmutils-arm64-$(PKG_TAG).tar.gz vmagent-arm64-prod vmalert-arm64-prod vmauth-arm64-prod vmbackup-arm64-prod vmrestore-arm64-prod && \
+		sha256sum vmutils-arm64-$(PKG_TAG).tar.gz > vmutils-arm64-$(PKG_TAG)_checksums.txt
+
+
 pprof-cpu:
 	go tool pprof -trim_path=github.com/VictoriaMetrics/VictoriaMetrics@ $(PPROF_FILE)
 
@@ -80,7 +103,7 @@ lint: install-golint
 	golint app/...
 
 install-golint:
-	which golint || GO111MODULE=off go get -u golang.org/x/lint/golint
+	which golint || go install golang.org/x/lint/golint
 
 errcheck: install-errcheck
 	errcheck -exclude=errcheck_excludes.txt ./lib/...
@@ -94,7 +117,7 @@ errcheck: install-errcheck
 	errcheck -exclude=errcheck_excludes.txt ./app/vmrestore/...
 
 install-errcheck:
-	which errcheck || GO111MODULE=off go get -u github.com/kisielk/errcheck
+	which errcheck || go install github.com/kisielk/errcheck
 
 check-all: fmt vet lint errcheck golangci-lint
 
@@ -122,8 +145,8 @@ benchmark-pure:
 	GO111MODULE=on CGO_ENABLED=0 go test -mod=vendor -bench=. ./app/...
 
 vendor-update:
-	GO111MODULE=on go get -u ./lib/...
-	GO111MODULE=on go get -u ./app/...
+	GO111MODULE=on go get -u -d ./lib/...
+	GO111MODULE=on go get -u -d ./app/...
 	GO111MODULE=on go mod tidy
 	GO111MODULE=on go mod vendor
 
@@ -133,18 +156,21 @@ app-local:
 app-local-pure:
 	CGO_ENABLED=0 GO111MODULE=on go build $(RACE) -mod=vendor -ldflags "$(GO_BUILDINFO)" -o bin/$(APP_NAME)-pure$(RACE) $(PKG_PREFIX)/app/$(APP_NAME)
 
+app-local-with-goarch:
+	GO111MODULE=on go build $(RACE) -mod=vendor -ldflags "$(GO_BUILDINFO)" -o bin/$(APP_NAME)-$(GOARCH)$(RACE) $(PKG_PREFIX)/app/$(APP_NAME)
+
 quicktemplate-gen: install-qtc
 	qtc
 
 install-qtc:
-	which qtc || GO111MODULE=off go get -u github.com/valyala/quicktemplate/qtc
+	which qtc || go install github.com/valyala/quicktemplate/qtc
 
 
 golangci-lint: install-golangci-lint
 	golangci-lint run --exclude '(SA4003|SA1019|SA5011):' -D errcheck -D structcheck --timeout 2m
 
 install-golangci-lint:
-	which golangci-lint || GO111MODULE=off go get -u github.com/golangci/golangci-lint/cmd/golangci-lint
+	which golangci-lint || curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(shell go env GOPATH)/bin v1.29.0
 
 docs-sync:
 	cp app/vmagent/README.md docs/vmagent.md

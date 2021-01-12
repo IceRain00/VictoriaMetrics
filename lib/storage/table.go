@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ type table struct {
 	bigPartitionsPath   string
 
 	getDeletedMetricIDs func() *uint64set.Set
+	retentionMsecs      int64
 
 	ptws     []*partitionWrapper
 	ptwsLock sync.Mutex
@@ -29,8 +31,7 @@ type table struct {
 
 	stop chan struct{}
 
-	retentionMilliseconds int64
-	retentionWatcherWG    sync.WaitGroup
+	retentionWatcherWG sync.WaitGroup
 }
 
 // partitionWrapper provides refcounting mechanism for the partition.
@@ -76,12 +77,12 @@ func (ptw *partitionWrapper) scheduleToDrop() {
 	atomic.AddUint64(&ptw.mustDrop, 1)
 }
 
-// openTable opens a table on the given path with the given retentionMonths.
+// openTable opens a table on the given path with the given retentionMsecs.
 //
 // The table is created if it doesn't exist.
 //
-// Data older than the retentionMonths may be dropped at any time.
-func openTable(path string, retentionMonths int, getDeletedMetricIDs func() *uint64set.Set) (*table, error) {
+// Data older than the retentionMsecs may be dropped at any time.
+func openTable(path string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64) (*table, error) {
 	path = filepath.Clean(path)
 
 	// Create a directory for the table if it doesn't exist yet.
@@ -114,7 +115,7 @@ func openTable(path string, retentionMonths int, getDeletedMetricIDs func() *uin
 	}
 
 	// Open partitions.
-	pts, err := openPartitions(smallPartitionsPath, bigPartitionsPath, getDeletedMetricIDs)
+	pts, err := openPartitions(smallPartitionsPath, bigPartitionsPath, getDeletedMetricIDs, retentionMsecs)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open partitions in the table %q: %w", path, err)
 	}
@@ -124,6 +125,7 @@ func openTable(path string, retentionMonths int, getDeletedMetricIDs func() *uin
 		smallPartitionsPath: smallPartitionsPath,
 		bigPartitionsPath:   bigPartitionsPath,
 		getDeletedMetricIDs: getDeletedMetricIDs,
+		retentionMsecs:      retentionMsecs,
 
 		flockF: flockF,
 
@@ -132,11 +134,6 @@ func openTable(path string, retentionMonths int, getDeletedMetricIDs func() *uin
 	for _, pt := range pts {
 		tb.addPartitionNolock(pt)
 	}
-	if retentionMonths <= 0 || retentionMonths > maxRetentionMonths {
-		retentionMonths = maxRetentionMonths
-	}
-	tb.retentionMilliseconds = int64(retentionMonths) * 31 * 24 * 3600 * 1e3
-
 	tb.startRetentionWatcher()
 	return tb, nil
 }
@@ -242,6 +239,26 @@ func (tb *table) UpdateMetrics(m *TableMetrics) {
 	tb.ptwsLock.Unlock()
 }
 
+// ForceMergePartitions force-merges partitions in tb with names starting from the given partitionNamePrefix.
+//
+// Partitions are merged sequentially in order to reduce load on the system.
+func (tb *table) ForceMergePartitions(partitionNamePrefix string) error {
+	ptws := tb.GetPartitions(nil)
+	defer tb.PutPartitions(ptws)
+	for _, ptw := range ptws {
+		if !strings.HasPrefix(ptw.pt.name, partitionNamePrefix) {
+			continue
+		}
+		logger.Infof("starting forced merge for partition %q", ptw.pt.name)
+		startTime := time.Now()
+		if err := ptw.pt.ForceMergeAllParts(); err != nil {
+			return fmt.Errorf("cannot complete forced merge for partition %q: %w", ptw.pt.name, err)
+		}
+		logger.Infof("forced merge for partition %q has been finished in %.3f seconds", ptw.pt.name, time.Since(startTime).Seconds())
+	}
+	return nil
+}
+
 // AddRows adds the given rows to the table tb.
 func (tb *table) AddRows(rows []rawRow) error {
 	if len(rows) == 0 {
@@ -336,7 +353,7 @@ func (tb *table) AddRows(rows []rawRow) error {
 			continue
 		}
 
-		pt, err := createPartition(r.Timestamp, tb.smallPartitionsPath, tb.bigPartitionsPath, tb.getDeletedMetricIDs)
+		pt, err := createPartition(r.Timestamp, tb.smallPartitionsPath, tb.bigPartitionsPath, tb.getDeletedMetricIDs, tb.retentionMsecs)
 		if err != nil {
 			errors = append(errors, err)
 			continue
@@ -355,7 +372,7 @@ func (tb *table) AddRows(rows []rawRow) error {
 
 func (tb *table) getMinMaxTimestamps() (int64, int64) {
 	now := int64(fasttime.UnixTimestamp() * 1000)
-	minTimestamp := now - tb.retentionMilliseconds
+	minTimestamp := now - tb.retentionMsecs
 	maxTimestamp := now + 2*24*3600*1000 // allow max +2 days from now due to timezones shit :)
 	if minTimestamp < 0 {
 		// Negative timestamps aren't supported by the storage.
@@ -385,7 +402,7 @@ func (tb *table) retentionWatcher() {
 		case <-ticker.C:
 		}
 
-		minTimestamp := int64(fasttime.UnixTimestamp()*1000) - tb.retentionMilliseconds
+		minTimestamp := int64(fasttime.UnixTimestamp()*1000) - tb.retentionMsecs
 		var ptwsDrop []*partitionWrapper
 		tb.ptwsLock.Lock()
 		dst := tb.ptws[:0]
@@ -436,7 +453,7 @@ func (tb *table) PutPartitions(ptws []*partitionWrapper) {
 	}
 }
 
-func openPartitions(smallPartitionsPath, bigPartitionsPath string, getDeletedMetricIDs func() *uint64set.Set) ([]*partition, error) {
+func openPartitions(smallPartitionsPath, bigPartitionsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64) ([]*partition, error) {
 	// Certain partition directories in either `big` or `small` dir may be missing
 	// after restoring from backup. So populate partition names from both dirs.
 	ptNames := make(map[string]bool)
@@ -450,7 +467,7 @@ func openPartitions(smallPartitionsPath, bigPartitionsPath string, getDeletedMet
 	for ptName := range ptNames {
 		smallPartsPath := smallPartitionsPath + "/" + ptName
 		bigPartsPath := bigPartitionsPath + "/" + ptName
-		pt, err := openPartition(smallPartsPath, bigPartsPath, getDeletedMetricIDs)
+		pt, err := openPartition(smallPartsPath, bigPartsPath, getDeletedMetricIDs, retentionMsecs)
 		if err != nil {
 			mustClosePartitions(pts)
 			return nil, fmt.Errorf("cannot open partition %q: %w", ptName, err)

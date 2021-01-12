@@ -1,23 +1,29 @@
 package promscrape
 
 import (
+	"context"
+	"crypto/tls"
+	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 	"github.com/VictoriaMetrics/fasthttp"
 	"github.com/VictoriaMetrics/metrics"
 )
 
-func statDial(addr string) (conn net.Conn, err error) {
-	if netutil.TCP6Enabled() {
-		conn, err = fasthttp.DialDualStack(addr)
-	} else {
-		conn, err = fasthttp.Dial(addr)
-	}
+func statStdDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := getStdDialer()
+	conn, err := d.DialContext(ctx, network, addr)
 	dialsTotal.Inc()
 	if err != nil {
 		dialErrors.Inc()
+		if !netutil.TCP6Enabled() {
+			err = fmt.Errorf("%w; try -enableTCP6 command-line flag if you scrape ipv6 addresses", err)
+		}
 		return nil, err
 	}
 	conns.Inc()
@@ -25,6 +31,46 @@ func statDial(addr string) (conn net.Conn, err error) {
 		Conn: conn,
 	}
 	return sc, nil
+}
+
+func getStdDialer() *net.Dialer {
+	stdDialerOnce.Do(func() {
+		stdDialer = &net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: netutil.TCP6Enabled(),
+		}
+	})
+	return stdDialer
+}
+
+var (
+	stdDialer     *net.Dialer
+	stdDialerOnce sync.Once
+)
+
+func newStatDialFunc(proxyURL proxy.URL, tlsConfig *tls.Config) (fasthttp.DialFunc, error) {
+	dialFunc, err := proxyURL.NewDialFunc(tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+	statDialFunc := func(addr string) (net.Conn, error) {
+		conn, err := dialFunc(addr)
+		dialsTotal.Inc()
+		if err != nil {
+			dialErrors.Inc()
+			if !netutil.TCP6Enabled() {
+				err = fmt.Errorf("%w; try -enableTCP6 command-line flag if you scrape ipv6 addresses", err)
+			}
+			return nil, err
+		}
+		conns.Inc()
+		sc := &statConn{
+			Conn: conn,
+		}
+		return sc, nil
+	}
+	return statDialFunc, nil
 }
 
 var (

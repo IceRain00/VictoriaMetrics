@@ -6,7 +6,9 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storagepacelimiter"
 )
 
 // BlockRef references a Block.
@@ -26,6 +28,36 @@ func (br *BlockRef) reset() {
 func (br *BlockRef) init(p *part, bh *blockHeader) {
 	br.p = p
 	br.bh = *bh
+}
+
+// Init initializes br from pr and data
+func (br *BlockRef) Init(pr PartRef, data []byte) error {
+	br.p = pr.p
+	tail, err := br.bh.Unmarshal(data)
+	if err != nil {
+		return err
+	}
+	if len(tail) > 0 {
+		return fmt.Errorf("unexpected non-empty tail left after unmarshaling blockHeader; len(tail)=%d; tail=%q", len(tail), tail)
+	}
+	return nil
+}
+
+// Marshal marshals br to dst.
+func (br *BlockRef) Marshal(dst []byte) []byte {
+	return br.bh.Marshal(dst)
+}
+
+// PartRef returns PartRef from br.
+func (br *BlockRef) PartRef() PartRef {
+	return PartRef{
+		p: br.p,
+	}
+}
+
+// PartRef is Part reference.
+type PartRef struct {
+	p *part
 }
 
 // MustReadBlock reads block from br to dst.
@@ -63,9 +95,20 @@ type Search struct {
 
 	ts tableSearch
 
+	// tr contains time range used in the serach.
+	tr TimeRange
+
+	// tfss contains tag filters used in the search.
+	tfss []*TagFilters
+
+	// deadline in unix timestamp seconds for the current search.
+	deadline uint64
+
 	err error
 
 	needClosing bool
+
+	loops int
 }
 
 func (s *Search) reset() {
@@ -74,24 +117,33 @@ func (s *Search) reset() {
 
 	s.storage = nil
 	s.ts.reset()
+	s.tr = TimeRange{}
+	s.tfss = nil
+	s.deadline = 0
 	s.err = nil
 	s.needClosing = false
+	s.loops = 0
 }
 
 // Init initializes s from the given storage, tfss and tr.
 //
 // MustClose must be called when the search is done.
-func (s *Search) Init(storage *Storage, tfss []*TagFilters, tr TimeRange, maxMetrics int) {
+//
+// Init returns the upper bound on the number of found time series.
+func (s *Search) Init(storage *Storage, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) int {
 	if s.needClosing {
 		logger.Panicf("BUG: missing MustClose call before the next call to Init")
 	}
 
 	s.reset()
+	s.tr = tr
+	s.tfss = tfss
+	s.deadline = deadline
 	s.needClosing = true
 
-	tsids, err := storage.searchTSIDs(tfss, tr, maxMetrics)
+	tsids, err := storage.searchTSIDs(tfss, tr, maxMetrics, deadline)
 	if err == nil {
-		err = storage.prefetchMetricNames(tsids)
+		err = storage.prefetchMetricNames(tsids, deadline)
 	}
 	// It is ok to call Init on error from storage.searchTSIDs.
 	// Init must be called before returning because it will fail
@@ -100,10 +152,11 @@ func (s *Search) Init(storage *Storage, tfss []*TagFilters, tr TimeRange, maxMet
 
 	if err != nil {
 		s.err = err
-		return
+		return 0
 	}
 
 	s.storage = storage
+	return len(tsids)
 }
 
 // MustClose closes the Search.
@@ -117,10 +170,10 @@ func (s *Search) MustClose() {
 
 // Error returns the last error from s.
 func (s *Search) Error() error {
-	if s.err == io.EOF {
+	if s.err == io.EOF || s.err == nil {
 		return nil
 	}
-	return s.err
+	return fmt.Errorf("error when searching for tagFilters=%s on the time range %s: %w", s.tfss, s.tr.String(), s.err)
 }
 
 // NextMetricBlock proceeds to the next MetricBlockRef.
@@ -129,6 +182,13 @@ func (s *Search) NextMetricBlock() bool {
 		return false
 	}
 	for s.ts.NextBlock() {
+		if s.loops&paceLimiterSlowIterationsMask == 0 {
+			if err := checkSearchDeadlineAndPace(s.deadline); err != nil {
+				s.err = err
+				return false
+			}
+		}
+		s.loops++
 		tsid := &s.ts.BlockRef.bh.TSID
 		var err error
 		s.MetricBlockRef.MetricName, err = s.storage.searchMetricName(s.MetricBlockRef.MetricName[:0], tsid.MetricID)
@@ -158,6 +218,15 @@ type SearchQuery struct {
 	MinTimestamp int64
 	MaxTimestamp int64
 	TagFilterss  [][]TagFilter
+}
+
+// NewSearchQuery creates new search query for the given args.
+func NewSearchQuery(start, end int64, tagFilterss [][]TagFilter) *SearchQuery {
+	return &SearchQuery{
+		MinTimestamp: start,
+		MaxTimestamp: end,
+		TagFilterss:  tagFilterss,
+	}
 }
 
 // TagFilter represents a single tag filter from SearchQuery.
@@ -312,3 +381,17 @@ func (sq *SearchQuery) Unmarshal(src []byte) ([]byte, error) {
 
 	return src, nil
 }
+
+func checkSearchDeadlineAndPace(deadline uint64) error {
+	if fasttime.UnixTimestamp() > deadline {
+		return ErrDeadlineExceeded
+	}
+	storagepacelimiter.Search.WaitIfNeeded()
+	return nil
+}
+
+const (
+	paceLimiterFastIterationsMask   = 1<<16 - 1
+	paceLimiterMediumIterationsMask = 1<<14 - 1
+	paceLimiterSlowIterationsMask   = 1<<12 - 1
+)

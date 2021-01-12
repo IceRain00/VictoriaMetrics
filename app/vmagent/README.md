@@ -21,13 +21,14 @@ to `vmagent` (like the ability to push metrics instead of pulling them). We did 
   See [Quick Start](#quick-start) for details.
 * Can add, remove and modify labels (aka tags) via Prometheus relabeling. Can filter data before sending it to remote storage. See [these docs](#relabeling) for details.
 * Accepts data via all the ingestion protocols supported by VictoriaMetrics:
-  * Influx line protocol via `http://<vmagent>:8429/write`. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-send-data-from-influxdb-compatible-agents-such-as-telegraf).
-  * Graphite plaintext protocol if `-graphiteListenAddr` command-line flag is set. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-send-data-from-graphite-compatible-agents-such-as-statsd).
-  * OpenTSDB telnet and http protocols if `-opentsdbListenAddr` command-line flag is set. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-send-data-from-opentsdb-compatible-agents).
+  * Influx line protocol via `http://<vmagent>:8429/write`. See [these docs](https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#how-to-send-data-from-influxdb-compatible-agents-such-as-telegraf).
+  * Graphite plaintext protocol if `-graphiteListenAddr` command-line flag is set. See [these docs](https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#how-to-send-data-from-graphite-compatible-agents-such-as-statsd).
+  * OpenTSDB telnet and http protocols if `-opentsdbListenAddr` command-line flag is set. See [these docs](https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#how-to-send-data-from-opentsdb-compatible-agents).
   * Prometheus remote write protocol via `http://<vmagent>:8429/api/v1/write`.
-  * JSON lines import protocol via `http://<vmagent>:8429/api/v1/import`. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-import-time-series-data).
-  * Data in Prometheus exposition format. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-import-data-in-prometheus-exposition-format) for details.
-  * Arbitrary CSV data via `http://<vmagent>:8429/api/v1/import/csv`. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-import-csv-data).
+  * JSON lines import protocol via `http://<vmagent>:8429/api/v1/import`. See [these docs](https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#how-to-import-data-in-json-line-format).
+  * Native data import protocol via `http://<vmagent>:8429/api/v1/import/native`. See [these docs](https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#how-to-import-data-in-native-format).
+  * Data in Prometheus exposition format. See [these docs](https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#how-to-import-data-in-prometheus-exposition-format) for details.
+  * Arbitrary CSV data via `http://<vmagent>:8429/api/v1/import/csv`. See [these docs](https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#how-to-import-csv-data).
 * Can replicate collected metrics simultaneously to multiple remote storage systems.
 * Works in environments with unstable connections to remote storage. If the remote storage is unavailable, the collected metrics
   are buffered at `-remoteWrite.tmpDataPath`. The buffered metrics are sent to remote storage as soon as connection
@@ -41,7 +42,7 @@ Just download `vmutils-*` archive from [releases page](https://github.com/Victor
 and pass the following flags to `vmagent` binary in order to start scraping Prometheus targets:
 
 * `-promscrape.config` with the path to Prometheus config file (it is usually located at `/etc/prometheus/prometheus.yml`)
-* `-remoteWrite.url` with the remote storage endpoint such as VictoriaMetrics. The `-remoteWrite.url` argument can be specified multiple times in order to replicate data concurrently to an arbitrary amount of remote storage systems.
+* `-remoteWrite.url` with the remote storage endpoint such as VictoriaMetrics. The `-remoteWrite.url` argument can be specified multiple times in order to replicate data concurrently to an arbitrary number of remote storage systems.
 
 Example command line:
 
@@ -55,11 +56,27 @@ If you only need to collect Influx data, then the following is sufficient:
 /path/to/vmagent -remoteWrite.url=https://victoria-metrics-host:8428/api/v1/write
 ```
 
-Then send Influx data to `http://vmagent-host:8429`. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-send-data-from-influxdb-compatible-agents-such-as-telegraf) for more details.
+Then send Influx data to `http://vmagent-host:8429`. See [these docs](https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#how-to-send-data-from-influxdb-compatible-agents-such-as-telegraf) for more details.
 
 `vmagent` is also available in [docker images](https://hub.docker.com/r/victoriametrics/vmagent/tags).
 
 Pass `-help` to `vmagent` in order to see the full list of supported command-line flags with their descriptions.
+
+
+### Configuration update
+
+`vmagent` should be restarted in order to update config options set via command-line args.
+
+`vmagent` supports multiple approaches for reloading configs from updated config files such as `-promscrape.config`, `-remoteWrite.relabelConfig` and `-remoteWrite.urlRelabelConfig`:
+
+* Sending `SUGHUP` signal to `vmagent` process:
+  ```bash
+  kill -SIGHUP `pidof vmagent`
+  ```
+
+* Sending HTTP request to `http://vmagent:8429/-/reload` endpoint.
+
+There is also `-promscrape.configCheckInterval` command-line option, which can be used for automatic reloading configs from updated `-promscrape.config` file.
 
 
 ### Use cases
@@ -135,7 +152,7 @@ The following scrape types in [scrape_config](https://prometheus.io/docs/prometh
   See [kubernetes_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#kubernetes_sd_config) for details.
 * `ec2_sd_configs` - for scraping targets in Amazon EC2.
   See [ec2_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#ec2_sd_config) for details.
-  `vmagent` doesn't support `role_arn` config param yet.
+  `vmagent` doesn't support `profile` config param and aws credentials file yet.
 * `gce_sd_configs` - for scraping targets in Google Compute Engine (GCE).
   See [gce_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#gce_sd_config) for details.
   `vmagent` provides the following additional functionality for `gce_sd_config`:
@@ -147,6 +164,13 @@ The following scrape types in [scrape_config](https://prometheus.io/docs/prometh
   See [consul_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#consul_sd_config) for details.
 * `dns_sd_configs` - for scraping targets discovered from DNS records (SRV, A and AAAA).
   See [dns_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dns_sd_config) for details.
+* `openstack_sd_configs` - for scraping OpenStack targets.
+  See [openstack_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#openstack_sd_config) for details.
+  [OpenStack identity API v3](https://docs.openstack.org/api-ref/identity/v3/) is supported only.
+* `dockerswarm_sd_configs` - for scraping Docker Swarm targets.
+  See [dockerswarm_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dockerswarm_sd_config) for details.
+* `eureka_sd_configs` - for scraping targets registered in [Netflix Eureka](https://github.com/Netflix/eureka).
+  See [eureka_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#eureka_sd_config) for details.
 
 File feature requests at [our issue tracker](https://github.com/VictoriaMetrics/VictoriaMetrics/issues) if you need other service discovery mechanisms to be supported by `vmagent`.
 
@@ -160,6 +184,8 @@ File feature requests at [our issue tracker](https://github.com/VictoriaMetrics/
 Note that `vmagent` doesn't support `refresh_interval` option these scrape configs. Use the corresponding `-promscrape.*CheckInterval`
 command-line flag instead. For example, `-promscrape.consulSDCheckInterval=60s` sets `refresh_interval` for all the `consul_sd_configs`
 entries to 60s. Run `vmagent -help` in order to see default values for `-promscrape.*CheckInterval` flags.
+
+The file pointed by `-promscrape.config` may contain `%{ENV_VAR}` placeholders, which are substituted by the corresponding `ENV_VAR` environment variable values.
 
 
 ### Adding labels to metrics
@@ -189,6 +215,7 @@ The relabeling can be defined in the following places:
 
 Read more about relabeling in the following articles:
 
+* [How to use Relabeling in Prometheus and VictoriaMetrics](https://valyala.medium.com/how-to-use-relabeling-in-prometheus-and-victoriametrics-8b90fc22c4b2)
 * [Life of a label](https://www.robustperception.io/life-of-a-label)
 * [Discarding targets and timeseries with relabeling](https://www.robustperception.io/relabelling-can-discard-targets-timeseries-and-alerts)
 * [Dropping labels at scrape time](https://www.robustperception.io/dropping-metrics-at-scrape-time-with-prometheus)
@@ -200,27 +227,76 @@ Read more about relabeling in the following articles:
 
 `vmagent` exports various metrics in Prometheus exposition format at `http://vmagent-host:8429/metrics` page. It is recommended setting up regular scraping of this page
 either via `vmagent` itself or via Prometheus, so the exported metrics could be analyzed later.
+Use official [Grafana dashboard](https://grafana.com/grafana/dashboards/12683) for `vmagent` state overview.
+If you have suggestions, improvements or found a bug - feel free to open an issue on github or add review to the dashboard.
 
-`vmagent` also exports target statuses at `http://vmagent-host:8429/targets` page in plaintext format.
+`vmagent` also exports target statuses at the following handlers:
+
+* `http://vmagent-host:8429/targets`. This handler returns human-readable plaintext status for every active target.
+This page is convenient to query from command line with `wget`, `curl` or similar tools.
+It accepts optional `show_original_labels=1` query arg, which shows the original labels per each target before applying relabeling.
+This information may be useful for debugging target relabeling.
+* `http://vmagent-host:8429/api/v1/targets`. This handler returns data compatible with [the corresponding page from Prometheus API](https://prometheus.io/docs/prometheus/latest/querying/api/#targets).
+
+* `http://vmagent-host:8429/ready`. This handler returns http 200 status code when `vmagent` finishes initialization for all service_discovery configs.
+It may be useful for performing `vmagent` rolling update without scrape loss.
 
 
 ### Troubleshooting
+
+* It is recommended [setting up the official Grafana dashboard](#monitoring) in order to monitor `vmagent` state.
 
 * It is recommended increasing the maximum number of open files in the system (`ulimit -n`) when scraping big number of targets,
   since `vmagent` establishes at least a single TCP connection per each target.
 
 * When `vmagent` scrapes many unreliable targets, it can flood error log with scrape errors. These errors can be suppressed
-  by passing `-promscrape.suppressScrapeErrors` command-line flag to `vmagent`. The most recent scrape error per each target can be observed at `http://vmagent-host:8429/targets`.
+  by passing `-promscrape.suppressScrapeErrors` command-line flag to `vmagent`. The most recent scrape error per each target can be observed at `http://vmagent-host:8429/targets`
+  and `http://vmagent-host:8429/api/v1/targets`.
 
-* It is recommended to increase `-remoteWrite.queues` if `vmagent` collects more than 100K samples per second
-  and `vmagent_remotewrite_pending_data_bytes` metric exported at `http://vmagent-host:8429/metrics` page constantly grows.
+* The `/api/v1/targets` page could be useful for debugging relabeling process for scrape targets.
+  This page contains original labels for targets dropped during relabeling (see "droppedTargets" section in the page output). By default up to `-promscrape.maxDroppedTargets` targets are shown here. If your setup drops more targets during relabeling, then increase `-promscrape.maxDroppedTargets` command-line flag value in order to see all the dropped targets. Note that tracking each dropped target requires up to 10Kb of RAM, so big values for `-promscrape.maxDroppedTargets` may result in increased memory usage if big number of scrape targets are dropped during relabeling.
+
+* If `vmagent` scrapes big number of targets, then `-promscrape.dropOriginalLabels` command-line option may be passed to `vmagent` in order to reduce memory usage.
+  This option drops `"discoveredLabels"` and `"droppedTargets"` lists at `/api/v1/targets` page, which may result in reduced debuggability for improperly configured per-target relabeling.
+
+* If `vmagent` scrapes targets with millions of metrics per each target (for instance, when scraping [federation endpoints](https://prometheus.io/docs/prometheus/latest/federation/)),
+  then it is recommended enabling `stream parsing mode` in order to reduce memory usage during scraping. This mode may be enabled either globally for all the scrape targets
+  by passing `-promscrape.streamParse` command-line flag or on a per-scrape target basis with `stream_parse: true` option. For example:
+
+  ```yml
+  scrape_configs:
+  - job_name: 'big-federate'
+    stream_parse: true
+    static_configs:
+    - targets:
+      - big-prometeus1
+      - big-prometeus2
+    honor_labels: true
+    metrics_path: /federate
+    params:
+      'match[]': ['{__name__!=""}']
+  ```
+
+  Note that `sample_limit` option doesn't work if stream parsing is enabled, since the parsed data is pushed to remote storage as soon as it is parsed. So `sample_limit` option
+  has no sense during stream parsing.
+
+* It is recommended to increase `-remoteWrite.queues` if `vmagent_remotewrite_pending_data_bytes` metric exported at `http://vmagent-host:8429/metrics` page constantly grows.
+
+* If you see gaps on the data pushed by `vmagent` to remote storage when `-remoteWrite.maxDiskUsagePerURL` is set, then try increasing `-remoteWrite.queues`.
+  Such gaps may appear because `vmagent` cannot keep up with sending the collected data to remote storage, so it starts dropping the buffered data
+  if the on-disk buffer size exceeds `-remoteWrite.maxDiskUsagePerURL`.
 
 * `vmagent` buffers scraped data at `-remoteWrite.tmpDataPath` directory until it is sent to `-remoteWrite.url`.
   The directory can grow large when remote storage is unavailable for extended periods of time and if `-remoteWrite.maxDiskUsagePerURL` isn't set.
   If you don't want to send all the data from the directory to remote storage, simply stop `vmagent` and delete the directory.
 
+* By default `vmagent` masks `-remoteWrite.url` with `secret-url` values in logs and at `/metrics` page because
+  the url may contain sensitive information such as auth tokens or passwords.
+  Pass `-remoteWrite.showURL` command-line flag when starting `vmagent` in order to see all the valid urls.
+
 * If you see `skipping duplicate scrape target with identical labels` errors when scraping Kubernetes pods, then it is likely these pods listen multiple ports
-  or they use init container.
+  or they use init container. These errors can be either fixed or suppressed with `-promscrape.suppressDuplicateScrapeTargetErrors` command-line flag.
+  See available options below if you prefer fixing the root cause of the error:
 
   The following `relabel_configs` section may help determining `__meta_*` labels resulting in duplicate targets:
   ```yml
@@ -265,12 +341,28 @@ Run `make package-vmagent`. It builds `victoriametrics/vmagent:<PKG_TAG>` docker
 `<PKG_TAG>` is auto-generated image tag, which depends on source code in the repository.
 The `<PKG_TAG>` may be manually set via `PKG_TAG=foobar make package-vmagent`.
 
-By default the image is built on top of [alpine](https://hub.docker.com/_/alpine) image. It is possible to build the package on top of any other base image
+The base docker image is [alpine](https://hub.docker.com/_/alpine) but it is possible to use any other base image
 by setting it via `<ROOT_IMAGE>` environment variable. For example, the following command builds the image on top of [scratch](https://hub.docker.com/_/scratch) image:
 
 ```bash
 ROOT_IMAGE=scratch make package-vmagent
 ```
+
+#### ARM build
+
+ARM build may run on Raspberry Pi or on [energy-efficient ARM servers](https://blog.cloudflare.com/arm-takes-wing/).
+
+#### Development ARM build
+
+1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.13.
+2. Run `make vmagent-arm` or `make vmagent-arm64` from the root folder of the repository.
+   It builds `vmagent-arm` or `vmagent-arm64` binary respectively and puts it into the `bin` folder.
+
+#### Production ARM build
+
+1. [Install docker](https://docs.docker.com/install/).
+2. Run `make vmagent-arm-prod` or `make vmagent-arm64-prod` from the root folder of the repository.
+   It builds `vmagent-arm-prod` or `vmagent-arm64-prod` binary respectively and puts it into the `bin` folder.
 
 
 ### Profiling

@@ -6,6 +6,32 @@ import (
 	"testing"
 )
 
+func TestMetricNameString(t *testing.T) {
+	f := func(mn *MetricName, resultExpected string) {
+		t.Helper()
+		result := mn.String()
+		if result != resultExpected {
+			t.Fatalf("unexpected result\ngot\n%s\nwant\n%s", result, resultExpected)
+		}
+	}
+	f(&MetricName{
+		MetricGroup: []byte("foobar"),
+	}, "foobar{}")
+	f(&MetricName{
+		MetricGroup: []byte("abc"),
+		Tags: []Tag{
+			{
+				Key:   []byte("foo"),
+				Value: []byte("bar"),
+			},
+			{
+				Key:   []byte("baz"),
+				Value: []byte("123"),
+			},
+		},
+	}, `abc{baz="123",foo="bar"}`)
+}
+
 func TestMetricNameSortTags(t *testing.T) {
 	testMetricNameSortTags(t, []string{}, []string{})
 	testMetricNameSortTags(t, []string{"foo"}, []string{"foo"})
@@ -38,15 +64,16 @@ func TestMetricNameMarshalDuplicateKeys(t *testing.T) {
 	var mn MetricName
 	mn.MetricGroup = []byte("xxx")
 	mn.AddTag("foo", "bar")
-	mn.AddTag("duplicate", "tag")
-	mn.AddTag("duplicate", "tag")
-	mn.AddTag("tt", "xx")
+	mn.AddTag("duplicate", "tag1")
 	mn.AddTag("duplicate", "tag2")
+	mn.AddTag("tt", "xx")
+	mn.AddTag("foo", "abc")
+	mn.AddTag("duplicate", "tag3")
 
 	var mnExpected MetricName
 	mnExpected.MetricGroup = []byte("xxx")
-	mnExpected.AddTag("duplicate", "tag")
-	mnExpected.AddTag("foo", "bar")
+	mnExpected.AddTag("duplicate", "tag3")
+	mnExpected.AddTag("foo", "abc")
 	mnExpected.AddTag("tt", "xx")
 
 	mn.sortTags()

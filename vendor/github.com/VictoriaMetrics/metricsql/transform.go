@@ -39,6 +39,8 @@ var transformFuncs = map[string]bool{
 	// New funcs from MetricsQL
 	"label_set":          true,
 	"label_map":          true,
+	"label_uppercase":    true,
+	"label_lowercase":    true,
 	"label_del":          true,
 	"label_keep":         true,
 	"label_copy":         true,
@@ -77,6 +79,7 @@ var transformFuncs = map[string]bool{
 	"asin":               true,
 	"acos":               true,
 	"prometheus_buckets": true,
+	"buckets_limit":      true,
 	"histogram_share":    true,
 	"sort_by_label":      true,
 	"sort_by_label_desc": true,

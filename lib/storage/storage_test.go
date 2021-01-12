@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"testing/quick"
@@ -103,7 +104,7 @@ func TestUpdateCurrHourMetricIDs(t *testing.T) {
 		s.pendingHourEntries = &uint64set.Set{}
 		return &s
 	}
-	t.Run("empty_pedning_metric_ids_stale_curr_hour", func(t *testing.T) {
+	t.Run("empty_pending_metric_ids_stale_curr_hour", func(t *testing.T) {
 		s := newStorage()
 		hour := uint64(timestampFromTime(time.Now())) / msecPerHour
 		hmOrig := &hourMetricIDs{
@@ -138,7 +139,7 @@ func TestUpdateCurrHourMetricIDs(t *testing.T) {
 			t.Fatalf("unexpected s.pendingHourEntries.Len(); got %d; want %d", s.pendingHourEntries.Len(), 0)
 		}
 	})
-	t.Run("empty_pedning_metric_ids_valid_curr_hour", func(t *testing.T) {
+	t.Run("empty_pending_metric_ids_valid_curr_hour", func(t *testing.T) {
 		s := newStorage()
 		hour := uint64(timestampFromTime(time.Now())) / msecPerHour
 		hmOrig := &hourMetricIDs{
@@ -353,8 +354,8 @@ func TestStorageOpenMultipleTimes(t *testing.T) {
 
 func TestStorageRandTimestamps(t *testing.T) {
 	path := "TestStorageRandTimestamps"
-	retentionMonths := 60
-	s, err := OpenStorage(path, retentionMonths)
+	retentionMsecs := int64(60 * msecsPerMonth)
+	s, err := OpenStorage(path, retentionMsecs)
 	if err != nil {
 		t.Fatalf("cannot open storage: %s", err)
 	}
@@ -364,7 +365,7 @@ func TestStorageRandTimestamps(t *testing.T) {
 				t.Fatal(err)
 			}
 			s.MustClose()
-			s, err = OpenStorage(path, retentionMonths)
+			s, err = OpenStorage(path, retentionMsecs)
 		}
 	})
 	t.Run("concurrent", func(t *testing.T) {
@@ -453,7 +454,7 @@ func TestStorageDeleteMetrics(t *testing.T) {
 	}
 
 	// Verify no tag keys exist
-	tks, err := s.SearchTagKeys(1e5)
+	tks, err := s.SearchTagKeys(1e5, noDeadline)
 	if err != nil {
 		t.Fatalf("error in SearchTagKeys at the start: %s", err)
 	}
@@ -504,7 +505,7 @@ func TestStorageDeleteMetrics(t *testing.T) {
 	})
 
 	// Verify no more tag keys exist
-	tks, err = s.SearchTagKeys(1e5)
+	tks, err = s.SearchTagKeys(1e5, noDeadline)
 	if err != nil {
 		t.Fatalf("error in SearchTagKeys after the test: %s", err)
 	}
@@ -557,10 +558,10 @@ func testStorageDeleteMetrics(s *Storage, workerNum int) error {
 			return fmt.Errorf("unexpected error when adding mrs: %w", err)
 		}
 	}
-	s.debugFlush()
+	s.DebugFlush()
 
 	// Verify tag values exist
-	tvs, err := s.SearchTagValues(workerTag, 1e5)
+	tvs, err := s.SearchTagValues(workerTag, 1e5, noDeadline)
 	if err != nil {
 		return fmt.Errorf("error in SearchTagValues before metrics removal: %w", err)
 	}
@@ -569,7 +570,7 @@ func testStorageDeleteMetrics(s *Storage, workerNum int) error {
 	}
 
 	// Verify tag keys exist
-	tks, err := s.SearchTagKeys(1e5)
+	tks, err := s.SearchTagKeys(1e5, noDeadline)
 	if err != nil {
 		return fmt.Errorf("error in SearchTagKeys before metrics removal: %w", err)
 	}
@@ -585,7 +586,7 @@ func testStorageDeleteMetrics(s *Storage, workerNum int) error {
 	metricBlocksCount := func(tfs *TagFilters) int {
 		// Verify the number of blocks
 		n := 0
-		sr.Init(s, []*TagFilters{tfs}, tr, 1e5)
+		sr.Init(s, []*TagFilters{tfs}, tr, 1e5, noDeadline)
 		for sr.NextMetricBlock() {
 			n++
 		}
@@ -633,7 +634,7 @@ func testStorageDeleteMetrics(s *Storage, workerNum int) error {
 	if n := metricBlocksCount(tfs); n != 0 {
 		return fmt.Errorf("expecting zero metric blocks after deleting all the metrics; got %d blocks", n)
 	}
-	tvs, err = s.SearchTagValues(workerTag, 1e5)
+	tvs, err = s.SearchTagValues(workerTag, 1e5, noDeadline)
 	if err != nil {
 		return fmt.Errorf("error in SearchTagValues after all the metrics are removed: %w", err)
 	}
@@ -661,6 +662,167 @@ func checkTagKeys(tks []string, tksExpected map[string]bool) error {
 			return fmt.Errorf("cannot find %q in tag keys %q", k, tks)
 		}
 	}
+	return nil
+}
+
+func TestStorageRegisterMetricNamesSerial(t *testing.T) {
+	path := "TestStorageRegisterMetricNamesSerial"
+	s, err := OpenStorage(path, 0)
+	if err != nil {
+		t.Fatalf("cannot open storage: %s", err)
+	}
+	if err := testStorageRegisterMetricNames(s); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	s.MustClose()
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatalf("cannot remove %q: %s", path, err)
+	}
+}
+
+func TestStorageRegisterMetricNamesConcurrent(t *testing.T) {
+	path := "TestStorageRegisterMetricNamesConcurrent"
+	s, err := OpenStorage(path, 0)
+	if err != nil {
+		t.Fatalf("cannot open storage: %s", err)
+	}
+	ch := make(chan error, 3)
+	for i := 0; i < cap(ch); i++ {
+		go func() {
+			ch <- testStorageRegisterMetricNames(s)
+		}()
+	}
+	for i := 0; i < cap(ch); i++ {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timeout")
+		}
+	}
+	s.MustClose()
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatalf("cannot remove %q: %s", path, err)
+	}
+}
+
+func testStorageRegisterMetricNames(s *Storage) error {
+	const metricsPerAdd = 1e3
+	const addsCount = 10
+
+	addIDsMap := make(map[string]struct{})
+	for i := 0; i < addsCount; i++ {
+		var mrs []MetricRow
+		var mn MetricName
+		addID := fmt.Sprintf("%d", i)
+		addIDsMap[addID] = struct{}{}
+		mn.Tags = []Tag{
+			{[]byte("job"), []byte("webservice")},
+			{[]byte("instance"), []byte("1.2.3.4")},
+			{[]byte("add_id"), []byte(addID)},
+		}
+		now := timestampFromTime(time.Now())
+		for j := 0; j < metricsPerAdd; j++ {
+			mn.MetricGroup = []byte(fmt.Sprintf("metric_%d", j))
+			metricNameRaw := mn.marshalRaw(nil)
+
+			mr := MetricRow{
+				MetricNameRaw: metricNameRaw,
+				Timestamp:     now,
+			}
+			mrs = append(mrs, mr)
+		}
+		if err := s.RegisterMetricNames(mrs); err != nil {
+			return fmt.Errorf("unexpected error in AddMetrics: %w", err)
+		}
+	}
+	var addIDsExpected []string
+	for k := range addIDsMap {
+		addIDsExpected = append(addIDsExpected, k)
+	}
+	sort.Strings(addIDsExpected)
+
+	// Verify the storage contains the added metric names.
+	s.DebugFlush()
+
+	// Verify that SearchTagKeys returns correct result.
+	tksExpected := []string{
+		"",
+		"add_id",
+		"instance",
+		"job",
+	}
+	tks, err := s.SearchTagKeys(100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagKeys: %w", err)
+	}
+	sort.Strings(tks)
+	if !reflect.DeepEqual(tks, tksExpected) {
+		return fmt.Errorf("unexpected tag keys returned from SearchTagKeys;\ngot\n%q\nwant\n%q", tks, tksExpected)
+	}
+
+	// Verify that SearchTagKeysOnTimeRange returns correct result.
+	now := timestampFromTime(time.Now())
+	start := now - msecPerDay
+	end := now + 60*1000
+	tr := TimeRange{
+		MinTimestamp: start,
+		MaxTimestamp: end,
+	}
+	tks, err = s.SearchTagKeysOnTimeRange(tr, 100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagKeysOnTimeRange: %w", err)
+	}
+	sort.Strings(tks)
+	if !reflect.DeepEqual(tks, tksExpected) {
+		return fmt.Errorf("unexpected tag keys returned from SearchTagKeysOnTimeRange;\ngot\n%q\nwant\n%q", tks, tksExpected)
+	}
+
+	// Verify that SearchTagValues returns correct result.
+	addIDs, err := s.SearchTagValues([]byte("add_id"), addsCount+100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagValues: %w", err)
+	}
+	sort.Strings(addIDs)
+	if !reflect.DeepEqual(addIDs, addIDsExpected) {
+		return fmt.Errorf("unexpected tag values returned from SearchTagValues;\ngot\n%q\nwant\n%q", addIDs, addIDsExpected)
+	}
+
+	// Verify that SearchTagValuesOnTimeRange returns correct result.
+	addIDs, err = s.SearchTagValuesOnTimeRange([]byte("add_id"), tr, addsCount+100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagValuesOnTimeRange: %w", err)
+	}
+	sort.Strings(addIDs)
+	if !reflect.DeepEqual(addIDs, addIDsExpected) {
+		return fmt.Errorf("unexpected tag values returned from SearchTagValuesOnTimeRange;\ngot\n%q\nwant\n%q", addIDs, addIDsExpected)
+	}
+
+	// Verify that SearchMetricNames returns correct result.
+	tfs := NewTagFilters()
+	if err := tfs.Add([]byte("add_id"), []byte("0"), false, false); err != nil {
+		return fmt.Errorf("unexpected error in TagFilters.Add: %w", err)
+	}
+	mns, err := s.SearchMetricNames([]*TagFilters{tfs}, tr, metricsPerAdd*addsCount*100+100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchMetricNames: %w", err)
+	}
+	if len(mns) < metricsPerAdd {
+		return fmt.Errorf("unexpected number of metricNames returned from SearchMetricNames; got %d; want at least %d", len(mns), int(metricsPerAdd))
+	}
+	for i, mn := range mns {
+		addID := mn.GetTagValue("add_id")
+		if string(addID) != "0" {
+			return fmt.Errorf("unexpected addID for metricName #%d; got %q; want %q", i, addID, "0")
+		}
+		job := mn.GetTagValue("job")
+		if string(job) != "webservice" {
+			return fmt.Errorf("unexpected job for metricName #%d; got %q; want %q", i, job, "webservice")
+		}
+	}
+
 	return nil
 }
 
@@ -771,6 +933,21 @@ func testStorageAddRows(s *Storage) error {
 	s1.UpdateMetrics(&m1)
 	if m1.TableMetrics.SmallRowsCount < minRowsExpected {
 		return fmt.Errorf("snapshot %q must contain at least %d rows; got %d", snapshotPath, minRowsExpected, m1.TableMetrics.SmallRowsCount)
+	}
+
+	// Verify that force merge for the snapshot leaves only a single part per partition.
+	if err := s1.ForceMergePartitions(""); err != nil {
+		return fmt.Errorf("error when force merging partitions: %w", err)
+	}
+	ptws := s1.tb.GetPartitions(nil)
+	defer s1.tb.PutPartitions(ptws)
+	for _, ptw := range ptws {
+		pws := ptw.pt.GetParts(nil)
+		numParts := len(pws)
+		ptw.pt.PutParts(pws)
+		if numParts != 1 {
+			return fmt.Errorf("unexpected number of parts for partition %q after force merge; got %d; want 1", ptw.pt.name, numParts)
+		}
 	}
 
 	s1.MustClose()

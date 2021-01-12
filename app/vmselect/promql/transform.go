@@ -18,11 +18,24 @@ import (
 )
 
 var transformFuncsKeepMetricGroup = map[string]bool{
-	"ceil":      true,
-	"clamp_max": true,
-	"clamp_min": true,
-	"floor":     true,
-	"round":     true,
+	"ceil":               true,
+	"clamp_max":          true,
+	"clamp_min":          true,
+	"floor":              true,
+	"round":              true,
+	"keep_last_value":    true,
+	"keep_next_value":    true,
+	"interpolate":        true,
+	"running_min":        true,
+	"running_max":        true,
+	"running_avg":        true,
+	"range_min":          true,
+	"range_max":          true,
+	"range_avg":          true,
+	"range_first":        true,
+	"range_last":         true,
+	"range_quantile":     true,
+	"smooth_exponential": true,
 }
 
 var transformFuncs = map[string]transformFunc{
@@ -60,6 +73,8 @@ var transformFuncs = map[string]transformFunc{
 	// New funcs
 	"label_set":          transformLabelSet,
 	"label_map":          transformLabelMap,
+	"label_uppercase":    transformLabelUppercase,
+	"label_lowercase":    transformLabelLowercase,
 	"label_del":          transformLabelDel,
 	"label_keep":         transformLabelKeep,
 	"label_copy":         transformLabelCopy,
@@ -98,6 +113,7 @@ var transformFuncs = map[string]transformFunc{
 	"asin":               newTransformFuncOneArg(transformAsin),
 	"acos":               newTransformFuncOneArg(transformAcos),
 	"prometheus_buckets": transformPrometheusBuckets,
+	"buckets_limit":      transformBucketsLimit,
 	"histogram_share":    transformHistogramShare,
 	"sort_by_label":      newTransformFuncSortByLabel(false),
 	"sort_by_label_desc": newTransformFuncSortByLabel(true),
@@ -153,23 +169,24 @@ func transformAbsent(tfa *transformFuncArg) ([]*timeseries, error) {
 	if err := expectTransformArgsNum(args, 1); err != nil {
 		return nil, err
 	}
-	arg := args[0]
-	if len(arg) == 0 {
-		rvs := getAbsentTimeseries(tfa.ec, tfa.fe.Args[0])
+	tss := args[0]
+	rvs := getAbsentTimeseries(tfa.ec, tfa.fe.Args[0])
+	if len(tss) == 0 {
 		return rvs, nil
 	}
-	for _, ts := range arg {
-		ts.MetricName.ResetMetricGroup()
-		for i, v := range ts.Values {
-			if !math.IsNaN(v) {
-				v = nan
-			} else {
-				v = 1
+	for i := range tss[0].Values {
+		isAbsent := true
+		for _, ts := range tss {
+			if !math.IsNaN(ts.Values[i]) {
+				isAbsent = false
+				break
 			}
-			ts.Values[i] = v
+		}
+		if !isAbsent {
+			rvs[0].Values[i] = nan
 		}
 	}
-	return arg, nil
+	return rvs, nil
 }
 
 func getAbsentTimeseries(ec *EvalConfig, arg metricsql.Expr) []*timeseries {
@@ -250,6 +267,9 @@ func newTransformFuncDateTime(f func(t time.Time) int) transformFunc {
 		}
 		tf := func(values []float64) {
 			for i, v := range values {
+				if math.IsNaN(v) {
+					continue
+				}
 				t := time.Unix(int64(v), 0).UTC()
 				values[i] = float64(f(t))
 			}
@@ -280,6 +300,101 @@ func transformExp(v float64) float64 {
 
 func transformFloor(v float64) float64 {
 	return math.Floor(v)
+}
+
+func transformBucketsLimit(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if err := expectTransformArgsNum(args, 2); err != nil {
+		return nil, err
+	}
+	limits, err := getScalar(args[0], 1)
+	if err != nil {
+		return nil, err
+	}
+	limit := int(limits[0])
+	if limit <= 0 {
+		return nil, nil
+	}
+	tss := vmrangeBucketsToLE(args[1])
+	if len(tss) == 0 {
+		return nil, nil
+	}
+
+	// Group timeseries by all MetricGroup+tags excluding `le` tag.
+	type x struct {
+		le   float64
+		hits float64
+		ts   *timeseries
+	}
+	m := make(map[string][]x)
+	var b []byte
+	var mn storage.MetricName
+	for _, ts := range tss {
+		leStr := ts.MetricName.GetTagValue("le")
+		if len(leStr) == 0 {
+			// Skip time series without `le` tag.
+			continue
+		}
+		le, err := strconv.ParseFloat(string(leStr), 64)
+		if err != nil {
+			// Skip time series with invalid `le` tag.
+			continue
+		}
+		mn.CopyFrom(&ts.MetricName)
+		mn.RemoveTag("le")
+		b = marshalMetricNameSorted(b[:0], &mn)
+		m[string(b)] = append(m[string(b)], x{
+			le: le,
+			ts: ts,
+		})
+	}
+
+	// Remove buckets with the smallest counters.
+	rvs := make([]*timeseries, 0, len(tss))
+	for _, leGroup := range m {
+		if len(leGroup) <= limit {
+			// Fast path - the number of buckets doesn't exceed the given limit.
+			// Keep all the buckets as is.
+			for _, xx := range leGroup {
+				rvs = append(rvs, xx.ts)
+			}
+			continue
+		}
+		// Slow path - remove buckets with the smallest number of hits until their count reaches the limit.
+
+		// Calculate per-bucket hits.
+		sort.Slice(leGroup, func(i, j int) bool {
+			return leGroup[i].le < leGroup[j].le
+		})
+		for n := range limits {
+			prevValue := float64(0)
+			for i := range leGroup {
+				xx := &leGroup[i]
+				value := xx.ts.Values[n]
+				xx.hits += value - prevValue
+				prevValue = value
+			}
+		}
+		for len(leGroup) > limit {
+			xxMinIdx := 0
+			for i, xx := range leGroup {
+				if xx.hits < leGroup[xxMinIdx].hits {
+					xxMinIdx = i
+				}
+			}
+			// Merge the leGroup[xxMinIdx] bucket with the smallest adjacent bucket in order to preserve
+			// the maximum accuracy.
+			if xxMinIdx+1 == len(leGroup) || (xxMinIdx > 0 && leGroup[xxMinIdx-1].hits < leGroup[xxMinIdx+1].hits) {
+				xxMinIdx--
+			}
+			leGroup[xxMinIdx+1].hits += leGroup[xxMinIdx].hits
+			leGroup = append(leGroup[:xxMinIdx], leGroup[xxMinIdx+1:]...)
+		}
+		for _, xx := range leGroup {
+			rvs = append(rvs, xx.ts)
+		}
+	}
+	return rvs, nil
 }
 
 func transformPrometheusBuckets(tfa *transformFuncArg) ([]*timeseries, error) {
@@ -828,10 +943,9 @@ func newTransformFuncRunning(rf func(a, b float64, idx int) float64) transformFu
 			prevValue := values[0]
 			values = values[1:]
 			for i, v := range values {
-				if math.IsNaN(v) {
-					continue
+				if !math.IsNaN(v) {
+					prevValue = rf(prevValue, v, i+1)
 				}
-				prevValue = rf(prevValue, v, i+1)
 				values[i] = prevValue
 			}
 		}
@@ -946,6 +1060,12 @@ func transformSmoothExponential(tfa *transformFuncArg) ([]*timeseries, error) {
 	rvs := args[0]
 	for _, ts := range rvs {
 		values := skipLeadingNaNs(ts.Values)
+		for i, v := range values {
+			if !math.IsInf(v, 0) {
+				values = values[i:]
+				break
+			}
+		}
 		if len(values) == 0 {
 			continue
 		}
@@ -954,6 +1074,10 @@ func transformSmoothExponential(tfa *transformFuncArg) ([]*timeseries, error) {
 		sfsX := sfs[len(ts.Values)-len(values):]
 		for i, v := range values {
 			if math.IsNaN(v) {
+				continue
+			}
+			if math.IsInf(v, 0) {
+				values[i] = avg
 				continue
 			}
 			sf := sfsX[i]
@@ -1068,6 +1192,42 @@ func transformLabelSet(tfa *transformFuncArg) ([]*timeseries, error) {
 			*dstValue = append((*dstValue)[:0], value...)
 			if len(value) == 0 {
 				mn.RemoveTag(dstLabel)
+			}
+		}
+	}
+	return rvs, nil
+}
+
+func transformLabelUppercase(tfa *transformFuncArg) ([]*timeseries, error) {
+	return transformLabelValueFunc(tfa, strings.ToUpper)
+}
+
+func transformLabelLowercase(tfa *transformFuncArg) ([]*timeseries, error) {
+	return transformLabelValueFunc(tfa, strings.ToLower)
+}
+
+func transformLabelValueFunc(tfa *transformFuncArg, f func(string) string) ([]*timeseries, error) {
+	args := tfa.args
+	if len(args) < 2 {
+		return nil, fmt.Errorf(`not enough args; got %d; want at least %d`, len(args), 2)
+	}
+	labels := make([]string, 0, len(args)-1)
+	for i := 1; i < len(args); i++ {
+		label, err := getString(args[i], i)
+		if err != nil {
+			return nil, err
+		}
+		labels = append(labels, label)
+	}
+
+	rvs := args[0]
+	for _, ts := range rvs {
+		mn := &ts.MetricName
+		for _, label := range labels {
+			dstValue := getDstValue(mn, label)
+			*dstValue = append((*dstValue)[:0], f(string(*dstValue))...)
+			if len(*dstValue) == 0 {
+				mn.RemoveTag(label)
 			}
 		}
 	}
@@ -1590,15 +1750,15 @@ func newTransformFuncZeroArgs(f func(tfa *transformFuncArg) float64) transformFu
 }
 
 func transformStep(tfa *transformFuncArg) float64 {
-	return float64(tfa.ec.Step) * 1e-3
+	return float64(tfa.ec.Step) / 1e3
 }
 
 func transformStart(tfa *transformFuncArg) float64 {
-	return float64(tfa.ec.Start) * 1e-3
+	return float64(tfa.ec.Start) / 1e3
 }
 
 func transformEnd(tfa *transformFuncArg) float64 {
-	return float64(tfa.ec.End) * 1e-3
+	return float64(tfa.ec.End) / 1e3
 }
 
 // copyTimeseriesMetricNames returns a copy of tss with real copy of MetricNames,

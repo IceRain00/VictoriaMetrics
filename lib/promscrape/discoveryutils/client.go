@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
 	"github.com/VictoriaMetrics/fasthttp"
 )
@@ -33,19 +33,38 @@ func GetHTTPClient() *http.Client {
 
 // Client is http client, which talks to the given apiServer.
 type Client struct {
-	hc        *fasthttp.HostClient
+	// hc is used for short requests.
+	hc *fasthttp.HostClient
+
+	// blockingClient is used for long-polling requests.
+	blockingClient *fasthttp.HostClient
+
 	ac        *promauth.Config
 	apiServer string
 	hostPort  string
 }
 
 // NewClient returns new Client for the given apiServer and the given ac.
-func NewClient(apiServer string, ac *promauth.Config) (*Client, error) {
-	var u fasthttp.URI
+func NewClient(apiServer string, ac *promauth.Config, proxyURL proxy.URL) (*Client, error) {
+	var (
+		dialFunc fasthttp.DialFunc
+		tlsCfg   *tls.Config
+		u        fasthttp.URI
+		err      error
+	)
 	u.Update(apiServer)
+
+	// special case for unix socket connection
+	if string(u.Scheme()) == "unix" {
+		dialAddr := string(u.Path())
+		apiServer = "http://"
+		dialFunc = func(_ string) (net.Conn, error) {
+			return net.Dial("unix", dialAddr)
+		}
+	}
+
 	hostPort := string(u.Host())
 	isTLS := string(u.Scheme()) == "https"
-	var tlsCfg *tls.Config
 	if isTLS && ac != nil {
 		tlsCfg = ac.NewTLSConfig()
 	}
@@ -56,24 +75,45 @@ func NewClient(apiServer string, ac *promauth.Config) (*Client, error) {
 		}
 		hostPort = net.JoinHostPort(hostPort, port)
 	}
+	if dialFunc == nil {
+		dialFunc, err = proxyURL.NewDialFunc(tlsCfg)
+		if err != nil {
+			return nil, err
+		}
+	}
 	hc := &fasthttp.HostClient{
 		Addr:                hostPort,
 		Name:                "vm_promscrape/discovery",
-		DialDualStack:       netutil.TCP6Enabled(),
 		IsTLS:               isTLS,
 		TLSConfig:           tlsCfg,
 		ReadTimeout:         time.Minute,
 		WriteTimeout:        10 * time.Second,
 		MaxResponseBodySize: 300 * 1024 * 1024,
 		MaxConns:            2 * *maxConcurrency,
+		Dial:                dialFunc,
+	}
+	blockingClient := &fasthttp.HostClient{
+		Addr:                hostPort,
+		Name:                "vm_promscrape/discovery",
+		IsTLS:               isTLS,
+		TLSConfig:           tlsCfg,
+		ReadTimeout:         BlockingClientReadTimeout,
+		WriteTimeout:        10 * time.Second,
+		MaxResponseBodySize: 300 * 1024 * 1024,
+		MaxConns:            64 * 1024,
+		Dial:                dialFunc,
 	}
 	return &Client{
-		hc:        hc,
-		ac:        ac,
-		apiServer: apiServer,
-		hostPort:  hostPort,
+		hc:             hc,
+		blockingClient: blockingClient,
+		ac:             ac,
+		apiServer:      apiServer,
+		hostPort:       hostPort,
 	}, nil
 }
+
+// BlockingClientReadTimeout is the maximum duration for waiting the response from GetBlockingAPI*
+const BlockingClientReadTimeout = 10 * time.Minute
 
 var (
 	concurrencyLimitCh     chan struct{}
@@ -82,6 +122,11 @@ var (
 
 func concurrencyLimitChInit() {
 	concurrencyLimitCh = make(chan struct{}, *maxConcurrency)
+}
+
+// Addr returns the address the client connects to.
+func (c *Client) Addr() string {
+	return c.hc.Addr
 }
 
 // GetAPIResponse returns response for the given absolute path.
@@ -98,7 +143,17 @@ func (c *Client) GetAPIResponse(path string) ([]byte, error) {
 			c.apiServer, *maxWaitTime, *maxConcurrency)
 	}
 	defer func() { <-concurrencyLimitCh }()
+	return c.getAPIResponseWithParamsAndClient(c.hc, path, nil)
+}
 
+// GetBlockingAPIResponse returns response for given absolute path with blocking client and optional callback for api response,
+// inspectResponse - should never reference data from response.
+func (c *Client) GetBlockingAPIResponse(path string, inspectResponse func(resp *fasthttp.Response)) ([]byte, error) {
+	return c.getAPIResponseWithParamsAndClient(c.blockingClient, path, inspectResponse)
+}
+
+// getAPIResponseWithParamsAndClient returns response for the given absolute path with optional callback for response.
+func (c *Client) getAPIResponseWithParamsAndClient(client *fasthttp.HostClient, path string, inspectResponse func(resp *fasthttp.Response)) ([]byte, error) {
 	requestURL := c.apiServer + path
 	var u fasthttp.URI
 	u.Update(requestURL)
@@ -109,9 +164,10 @@ func (c *Client) GetAPIResponse(path string) ([]byte, error) {
 	if c.ac != nil && c.ac.Authorization != "" {
 		req.Header.Set("Authorization", c.ac.Authorization)
 	}
+
 	var resp fasthttp.Response
-	// There is no need in calling DoTimeout, since the timeout is already set in c.hc.ReadTimeout above.
-	if err := c.hc.Do(&req, &resp); err != nil {
+	deadline := time.Now().Add(client.ReadTimeout)
+	if err := doRequestWithPossibleRetry(client, &req, &resp, deadline); err != nil {
 		return nil, fmt.Errorf("cannot fetch %q: %w", requestURL, err)
 	}
 	var data []byte
@@ -124,10 +180,31 @@ func (c *Client) GetAPIResponse(path string) ([]byte, error) {
 	} else {
 		data = append(data[:0], resp.Body()...)
 	}
+	if inspectResponse != nil {
+		inspectResponse(&resp)
+	}
 	statusCode := resp.StatusCode()
 	if statusCode != fasthttp.StatusOK {
 		return nil, fmt.Errorf("unexpected status code returned from %q: %d; expecting %d; response body: %q",
 			requestURL, statusCode, fasthttp.StatusOK, data)
 	}
 	return data, nil
+}
+
+func doRequestWithPossibleRetry(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time) error {
+	for {
+		// Use DoDeadline instead of Do even if hc.ReadTimeout is already set in order to guarantee the given deadline
+		// across multiple retries.
+		err := hc.DoDeadline(req, resp, deadline)
+		if err == nil {
+			return nil
+		}
+		if err != fasthttp.ErrConnectionClosed {
+			return err
+		}
+		// Retry request if the server closes the keep-alive connection unless deadline exceeds.
+		if time.Since(deadline) >= 0 {
+			return fmt.Errorf("the server closes all the connection attempts: %w", err)
+		}
+	}
 }

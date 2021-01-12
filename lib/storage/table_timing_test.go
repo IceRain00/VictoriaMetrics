@@ -4,9 +4,10 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"runtime"
 	"testing"
 	"time"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 )
 
 func BenchmarkTableAddRows(b *testing.B) {
@@ -45,7 +46,7 @@ func benchmarkTableAddRows(b *testing.B, rowsPerInsert, tsidsCount int) {
 	b.SetBytes(int64(rowsCountExpected))
 	tablePath := "./benchmarkTableAddRows"
 	for i := 0; i < b.N; i++ {
-		tb, err := openTable(tablePath, -1, nilGetDeletedMetricIDs)
+		tb, err := openTable(tablePath, nilGetDeletedMetricIDs, maxRetentionMsecs)
 		if err != nil {
 			b.Fatalf("cannot open table %q: %s", tablePath, err)
 		}
@@ -57,7 +58,7 @@ func benchmarkTableAddRows(b *testing.B, rowsPerInsert, tsidsCount int) {
 		close(workCh)
 
 		doneCh := make(chan struct{})
-		gomaxprocs := runtime.GOMAXPROCS(-1)
+		gomaxprocs := cgroup.AvailableCPUs()
 
 		for j := 0; j < gomaxprocs; j++ {
 			go func(goroutineID int) {
@@ -93,7 +94,7 @@ func benchmarkTableAddRows(b *testing.B, rowsPerInsert, tsidsCount int) {
 		tb.MustClose()
 
 		// Open the table from files and verify the rows count on it
-		tb, err = openTable(tablePath, -1, nilGetDeletedMetricIDs)
+		tb, err = openTable(tablePath, nilGetDeletedMetricIDs, maxRetentionMsecs)
 		if err != nil {
 			b.Fatalf("cannot open table %q: %s", tablePath, err)
 		}

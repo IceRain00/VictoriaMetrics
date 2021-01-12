@@ -103,7 +103,7 @@ again:
 		token = s[:n]
 		goto tokenFoundLabel
 	}
-	if n := scanDuration(s, false); n > 0 {
+	if n := scanDuration(s); n > 0 {
 		token = s[:n]
 		goto tokenFoundLabel
 	}
@@ -149,6 +149,15 @@ func scanString(s string) (string, error) {
 func scanPositiveNumber(s string) (string, error) {
 	// Scan integer part. It may be empty if fractional part exists.
 	i := 0
+	skipChars, isHex := scanSpecialIntegerPrefix(s)
+	i += skipChars
+	if isHex {
+		// Scan integer hex number
+		for i < len(s) && isHexChar(s[i]) {
+			i++
+		}
+		return s[:i], nil
+	}
 	for i < len(s) && isDecimalChar(s[i]) {
 		i++
 	}
@@ -366,13 +375,45 @@ func isPositiveNumberPrefix(s string) bool {
 	return isDecimalChar(s[1])
 }
 
+func isSpecialIntegerPrefix(s string) bool {
+	skipChars, _ := scanSpecialIntegerPrefix(s)
+	return skipChars > 0
+}
+
+func scanSpecialIntegerPrefix(s string) (skipChars int, isHex bool) {
+	if len(s) < 1 || s[0] != '0' {
+		return 0, false
+	}
+	s = strings.ToLower(s[1:])
+	if len(s) == 0 {
+		return 0, false
+	}
+	if isDecimalChar(s[0]) {
+		// octal number: 0123
+		return 1, false
+	}
+	if s[0] == 'x' {
+		// 0x
+		return 2, true
+	}
+	if s[0] == 'o' || s[0] == 'b' {
+		// 0x, 0o or 0b prefix
+		return 2, false
+	}
+	return 0, false
+}
+
 func isPositiveDuration(s string) bool {
-	n := scanDuration(s, false)
+	n := scanDuration(s)
 	return n == len(s)
 }
 
-// PositiveDurationValue returns the duration in milliseconds for the given s
+// PositiveDurationValue returns positive duration in milliseconds for the given s
 // and the given step.
+//
+// Duration in s may be combined, i.e. 2h5m or 2h-5m.
+//
+// Error is returned if the duration in s is negative.
 func PositiveDurationValue(s string, step int64) (int64, error) {
 	d, err := DurationValue(s, step)
 	if err != nil {
@@ -387,33 +428,64 @@ func PositiveDurationValue(s string, step int64) (int64, error) {
 // DurationValue returns the duration in milliseconds for the given s
 // and the given step.
 //
+// Duration in s may be combined, i.e. 2h5m, -2h5m or 2h-5m.
+//
 // The returned duration value can be negative.
 func DurationValue(s string, step int64) (int64, error) {
-	n := scanDuration(s, true)
-	if n != len(s) {
-		return 0, fmt.Errorf("cannot parse duration %q", s)
+	if len(s) == 0 {
+		return 0, fmt.Errorf("duration cannot be empty")
 	}
+	var d int64
+	isMinus := false
+	for len(s) > 0 {
+		n := scanSingleDuration(s, true)
+		if n <= 0 {
+			return 0, fmt.Errorf("cannot parse duration %q", s)
+		}
+		ds := s[:n]
+		s = s[n:]
+		dLocal, err := parseSingleDuration(ds, step)
+		if err != nil {
+			return 0, err
+		}
+		if isMinus && dLocal > 0 {
+			dLocal = -dLocal
+		}
+		d += dLocal
+		if dLocal < 0 {
+			isMinus = true
+		}
+	}
+	return d, nil
+}
 
-	f, err := strconv.ParseFloat(s[:len(s)-1], 64)
+func parseSingleDuration(s string, step int64) (int64, error) {
+	numPart := s[:len(s)-1]
+	if strings.HasSuffix(numPart, "m") {
+		// Duration in ms
+		numPart = numPart[:len(numPart)-1]
+	}
+	f, err := strconv.ParseFloat(numPart, 64)
 	if err != nil {
 		return 0, fmt.Errorf("cannot parse duration %q: %s", s, err)
 	}
-
 	var mp float64
-	switch s[len(s)-1] {
-	case 's':
+	switch s[len(numPart):] {
+	case "ms":
+		mp = 1e-3
+	case "s":
 		mp = 1
-	case 'm':
+	case "m":
 		mp = 60
-	case 'h':
+	case "h":
 		mp = 60 * 60
-	case 'd':
+	case "d":
 		mp = 24 * 60 * 60
-	case 'w':
+	case "w":
 		mp = 7 * 24 * 60 * 60
-	case 'y':
+	case "y":
 		mp = 365 * 24 * 60 * 60
-	case 'i':
+	case "i":
 		mp = float64(step) / 1e3
 	default:
 		return 0, fmt.Errorf("invalid duration suffix in %q", s)
@@ -421,7 +493,29 @@ func DurationValue(s string, step int64) (int64, error) {
 	return int64(mp * f * 1e3), nil
 }
 
-func scanDuration(s string, canBeNegative bool) int {
+// scanDuration scans duration, which must start with positive num.
+//
+// I.e. 123h, 3h5m or 3.4d-35.66s
+func scanDuration(s string) int {
+	// The first part must be non-negative
+	n := scanSingleDuration(s, false)
+	if n <= 0 {
+		return -1
+	}
+	s = s[n:]
+	i := n
+	for {
+		// Other parts may be negative
+		n := scanSingleDuration(s, true)
+		if n <= 0 {
+			return i
+		}
+		s = s[n:]
+		i += n
+	}
+}
+
+func scanSingleDuration(s string, canBeNegative bool) int {
 	if len(s) == 0 {
 		return -1
 	}
@@ -446,7 +540,14 @@ func scanDuration(s string, canBeNegative bool) int {
 		}
 	}
 	switch s[i] {
-	case 's', 'm', 'h', 'd', 'w', 'y', 'i':
+	case 'm':
+		if i+1 < len(s) && s[i+1] == 's' {
+			// duration in ms
+			return i + 2
+		}
+		// duration in minutes
+		return i + 1
+	case 's', 'h', 'd', 'w', 'y', 'i':
 		return i + 1
 	default:
 		return -1
@@ -455,6 +556,10 @@ func scanDuration(s string, canBeNegative bool) int {
 
 func isDecimalChar(ch byte) bool {
 	return ch >= '0' && ch <= '9'
+}
+
+func isHexChar(ch byte) bool {
+	return isDecimalChar(ch) || ch >= 'a' && ch <= 'f' || ch >= 'A' && ch <= 'F'
 }
 
 func isIdentPrefix(s string) bool {

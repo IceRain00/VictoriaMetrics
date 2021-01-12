@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -219,19 +222,6 @@ func TestAlertingRule_Exec(t *testing.T) {
 			},
 		},
 		{
-			newTestAlertingRule("duplicate", 0),
-			[][]datasource.Metric{
-				{
-					// metrics with the same labelset should result in one alert
-					metricWithLabels(t, "name", "foo", "type", "bar"),
-					metricWithLabels(t, "type", "bar", "name", "foo"),
-				},
-			},
-			map[uint64]*notifier.Alert{
-				hash(metricWithLabels(t, "name", "foo", "type", "bar")): {State: notifier.StateFiring},
-			},
-		},
-		{
 			newTestAlertingRule("for-pending", time.Minute),
 			[][]datasource.Metric{
 				{metricWithLabels(t, "name", "foo")},
@@ -355,6 +345,7 @@ func TestAlertingRule_Restore(t *testing.T) {
 				metricWithValueAndLabels(t, float64(time.Now().Truncate(time.Hour).Unix()),
 					"__name__", alertForStateMetricName,
 					alertNameLabel, "",
+					alertGroupNameLabel, "groupID",
 					"foo", "bar",
 					"namespace", "baz",
 				),
@@ -375,7 +366,7 @@ func TestAlertingRule_Restore(t *testing.T) {
 					alertNameLabel, "",
 					"foo", "bar",
 					"namespace", "baz",
-					// following pair supposed to be dropped
+					// extra labels set by rule
 					"source", "vm",
 				),
 			},
@@ -383,6 +374,7 @@ func TestAlertingRule_Restore(t *testing.T) {
 				hash(metricWithLabels(t,
 					"foo", "bar",
 					"namespace", "baz",
+					"source", "vm",
 				)): {State: notifier.StatePending,
 					Start: time.Now().Truncate(time.Hour)},
 			},
@@ -419,7 +411,7 @@ func TestAlertingRule_Restore(t *testing.T) {
 			fq := &fakeQuerier{}
 			tc.rule.GroupID = fakeGroup.ID()
 			fq.add(tc.metrics...)
-			if err := tc.rule.Restore(context.TODO(), fq, time.Hour); err != nil {
+			if err := tc.rule.Restore(context.TODO(), fq, time.Hour, nil); err != nil {
 				t.Fatalf("unexpected err: %s", err)
 			}
 			if len(tc.rule.alerts) != len(tc.expAlerts) {
@@ -435,6 +427,138 @@ func TestAlertingRule_Restore(t *testing.T) {
 				}
 				if got.Start != exp.Start {
 					t.Fatalf("expected Start %v; got %v", exp.Start, got.Start)
+				}
+			}
+		})
+	}
+}
+
+func TestAlertingRule_Exec_Negative(t *testing.T) {
+	fq := &fakeQuerier{}
+	ar := newTestAlertingRule("test", 0)
+	ar.Labels = map[string]string{"job": "test"}
+
+	// successful attempt
+	fq.add(metricWithValueAndLabels(t, 1, "__name__", "foo", "job", "bar"))
+	_, err := ar.Exec(context.TODO(), fq, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// label `job` will collide with rule extra label and will make both time series equal
+	fq.add(metricWithValueAndLabels(t, 1, "__name__", "foo", "job", "baz"))
+	_, err = ar.Exec(context.TODO(), fq, false)
+	if !errors.Is(err, errDuplicate) {
+		t.Fatalf("expected to have %s error; got %s", errDuplicate, err)
+	}
+
+	fq.reset()
+
+	expErr := "connection reset by peer"
+	fq.setErr(errors.New(expErr))
+	_, err = ar.Exec(context.TODO(), fq, false)
+	if err == nil {
+		t.Fatalf("expected to get err; got nil")
+	}
+	if !strings.Contains(err.Error(), expErr) {
+		t.Fatalf("expected to get err %q; got %q insterad", expErr, err)
+	}
+}
+
+func TestAlertingRule_Template(t *testing.T) {
+	testCases := []struct {
+		rule      *AlertingRule
+		metrics   []datasource.Metric
+		expAlerts map[uint64]*notifier.Alert
+	}{
+		{
+			newTestRuleWithLabels("common", "region", "east"),
+			[]datasource.Metric{
+				metricWithValueAndLabels(t, 1, "instance", "foo"),
+				metricWithValueAndLabels(t, 1, "instance", "bar"),
+			},
+			map[uint64]*notifier.Alert{
+				hash(metricWithLabels(t, "region", "east", "instance", "foo")): {
+					Annotations: map[string]string{},
+					Labels: map[string]string{
+						alertGroupNameLabel: "",
+						"region":            "east",
+						"instance":          "foo",
+					},
+				},
+				hash(metricWithLabels(t, "region", "east", "instance", "bar")): {
+					Annotations: map[string]string{},
+					Labels: map[string]string{
+						alertGroupNameLabel: "",
+						"region":            "east",
+						"instance":          "bar",
+					},
+				},
+			},
+		},
+		{
+			&AlertingRule{
+				Name: "override label",
+				Labels: map[string]string{
+					"instance": "{{ $labels.instance }}",
+					"region":   "east",
+				},
+				Annotations: map[string]string{
+					"summary":     `Too high connection number for "{{ $labels.instance }}" for region {{ $labels.region }}`,
+					"description": `It is {{ $value }} connections for "{{ $labels.instance }}"`,
+				},
+				alerts: make(map[uint64]*notifier.Alert),
+			},
+			[]datasource.Metric{
+				metricWithValueAndLabels(t, 2, "instance", "foo"),
+				metricWithValueAndLabels(t, 10, "instance", "bar"),
+			},
+			map[uint64]*notifier.Alert{
+				hash(metricWithLabels(t, "region", "east", "instance", "foo")): {
+					Labels: map[string]string{
+						alertGroupNameLabel: "",
+						"instance":          "foo",
+						"region":            "east",
+					},
+					Annotations: map[string]string{
+						"summary":     `Too high connection number for "foo" for region east`,
+						"description": `It is 2 connections for "foo"`,
+					},
+				},
+				hash(metricWithLabels(t, "region", "east", "instance", "bar")): {
+					Labels: map[string]string{
+						alertGroupNameLabel: "",
+						"instance":          "bar",
+						"region":            "east",
+					},
+					Annotations: map[string]string{
+						"summary":     `Too high connection number for "bar" for region east`,
+						"description": `It is 10 connections for "bar"`,
+					},
+				},
+			},
+		},
+	}
+	fakeGroup := Group{Name: "TestRule_Exec"}
+	for _, tc := range testCases {
+		t.Run(tc.rule.Name, func(t *testing.T) {
+			fq := &fakeQuerier{}
+			tc.rule.GroupID = fakeGroup.ID()
+			fq.add(tc.metrics...)
+			if _, err := tc.rule.Exec(context.TODO(), fq, false); err != nil {
+				t.Fatalf("unexpected err: %s", err)
+			}
+			for hash, expAlert := range tc.expAlerts {
+				gotAlert := tc.rule.alerts[hash]
+				if gotAlert == nil {
+					t.Fatalf("alert %d is missing; labels: %v; annotations: %v",
+						hash, expAlert.Labels, expAlert.Annotations)
+				}
+				if !reflect.DeepEqual(expAlert.Annotations, gotAlert.Annotations) {
+					t.Fatalf("expected to have annotations %#v; got %#v", expAlert.Annotations, gotAlert.Annotations)
+				}
+				if !reflect.DeepEqual(expAlert.Labels, gotAlert.Labels) {
+					t.Fatalf("expected to have labels %#v; got %#v", expAlert.Labels, gotAlert.Labels)
 				}
 			}
 		})

@@ -43,6 +43,10 @@ func loadRelabelConfigs() (*relabelConfigs, error) {
 	}
 	rcs.perURL = make([][]promrelabel.ParsedRelabelConfig, len(*remoteWriteURLs))
 	for i, path := range *relabelConfigPaths {
+		if len(path) == 0 {
+			// Skip empty relabel config.
+			continue
+		}
 		prc, err := promrelabel.LoadRelabelConfigs(path)
 		if err != nil {
 			return nil, fmt.Errorf("cannot load relabel configs from -remoteWrite.urlRelabelConfig=%q: %w", path, err)
@@ -61,6 +65,9 @@ type relabelConfigs struct {
 func initLabelsGlobal() {
 	labelsGlobal = nil
 	for _, s := range *unparsedLabelsGlobal {
+		if len(s) == 0 {
+			continue
+		}
 		n := strings.IndexByte(s, '=')
 		if n < 0 {
 			logger.Fatalf("missing '=' in `-remoteWrite.label`. It must contain label in the form `name=value`; got %q", s)
@@ -113,12 +120,7 @@ type relabelCtx struct {
 }
 
 func (rctx *relabelCtx) reset() {
-	labels := rctx.labels
-	for i := range labels {
-		label := &labels[i]
-		label.Name = ""
-		label.Value = ""
-	}
+	promrelabel.CleanLabels(rctx.labels)
 	rctx.labels = rctx.labels[:0]
 }
 
